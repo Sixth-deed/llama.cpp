@@ -6,7 +6,7 @@ cd "$(dirname "$0")/../../" || exit 1
 
 # Defaults
 BUILD_TYPE="release"
-MODEL_PATH="/mnt/win_E/llm_model/Qwen3-14B-Q4_K_M.gguf"
+MODEL_PATH="/home/hitori/code/impl_ai/model/Qwen3-14B-Q4_K_M.gguf"
 MODE="pipo"
 N_GL="10"
 N_PREDICT="32"
@@ -52,9 +52,9 @@ fi
 
 # Prepare Command Arguments
 CMD_ARGS="-m $MODEL_PATH -ngl $N_GL -n $N_PREDICT"
-if [[ "$MODE" == "pipo" ]]; then
-    CMD_ARGS="$CMD_ARGS -pipo"
-fi
+# if [[ "$MODE" == "pipo" ]]; then
+#     CMD_ARGS="$CMD_ARGS -pipo"
+# fi
 
 # Prepare Log Directory and File
 MODEL_FILENAME=$(basename "$MODEL_PATH")

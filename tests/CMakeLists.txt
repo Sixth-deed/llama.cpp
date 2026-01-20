@@ -265,3 +265,6 @@ target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 add_executable(test-backend-ops-perf test-backend-ops-perf.cpp)
 target_link_libraries(test-backend-ops-perf PRIVATE common ggml)
 
+add_executable(test-backend-ops-perf2 test-backend-ops-perf2.cpp)
+target_link_libraries(test-backend-ops-perf2 PRIVATE common ggml)
+target_include_directories(test-backend-ops-perf2 PRIVATE ${PROJECT_SOURCE_DIR}/vendor)

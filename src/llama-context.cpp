@@ -14,6 +14,9 @@
 #include <limits>
 #include <stdexcept>
 
+#include <string>
+#include <unordered_set>
+#include "../common/base64.hpp"
 //
 // llama_context
 //
@@ -1125,7 +1128,66 @@ bool llama_context::apply_adapter_cvec(
 
     return cvec.apply(model, data, len, n_embd, il_start, il_end);
 }
+static bool pipo_is_view_op(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
 
+static std::string pipo_make_op_key(const ggml_tensor * node) {
+    std::string key;
+    key.reserve(256);
+
+    key += std::to_string((int) node->op);
+    key += "#";
+    key += std::to_string((int) node->type);
+    // the node size info
+    key += '[';
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        key += ',';
+        key += std::to_string((long long) node->ne[d]);
+    }
+    key += "]#";
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * src = node->src[j];
+        if (!src) break;
+
+        key += '|';
+        key += std::to_string((int) src->type);
+        key += '[';
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            key += ',';
+            key += std::to_string((long long) src->ne[d]);
+        }
+        key += ']';
+    }
+    key += '#';
+    // key += std::string(reinterpret_cast<const char*>(node->op_params), sizeof(node->op_params));
+    // base64 encode the op_params
+    key += base64::encode(std::string(reinterpret_cast<const char*>(node->op_params), sizeof(node->op_params)));
+    return key;
+}
+static void pipo_op_recorder(ggml_cgraph * gf) {
+    static std::unordered_set<std::string> seen_ops;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (!node) continue;
+
+        if (pipo_is_view_op(node->op)) continue;
+
+        const std::string key = pipo_make_op_key(node);
+        if (!seen_ops.insert(key).second) continue;
+
+        fprintf(stdout, "\nop_key[%zu]: ", key.size());
+        fwrite(key.data(), 1, key.size(), stdout);
+    }
+}
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1166,7 +1228,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
-
+        pipo_op_recorder(gf);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
