@@ -142,6 +142,7 @@ add_library(llama
             models/xverse.cpp
             models/mistral3.cpp
             models/graph-context-mamba.cpp
+            pipo_op_perf.cpp
             )
 
 set_target_properties(llama PROPERTIES

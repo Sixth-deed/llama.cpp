@@ -1,4 +1,6 @@
 #include "base64.hpp"
+#include "llama.h"
+#include "pipo_op_perf.h"
 
 #include <fstream>
 #include <iostream>
@@ -31,36 +33,6 @@ static string read_file(const string & path) {
     return out;
 }
 
-static void debug_print_whole_json(const nlohmann::json & j) {
-    for (const auto & e : j) {
-        int    op_id        = e.at("node").at("op").get<int>();
-        string op_param_b64 = e.at("op_param").get<string>();
-
-        string          op_param_raw = base64::decode(op_param_b64);  // binary bytes
-        vector<uint8_t> op_param_bytes(op_param_raw.begin(), op_param_raw.end());
-
-        cerr << "op_id: " << op_id << '\n';
-        cerr << "op_param_bytes: " << op_param_bytes.size() << '\n';
-        for (size_t i = 0; i < op_param_bytes.size(); i++) {
-            cerr << "op_param_bytes[" << i << "]: " << op_param_bytes[i] << '\n';
-        }
-        cerr << '\n';
-
-        // srcs
-        const auto & srcs = e.at("srcs");
-        for (const auto & src : srcs) {
-            int          type = src.at("type").get<int>();
-            const auto & ne   = src.at("ne");
-            cerr << "src_type: " << type << '\n';
-            cerr << "src_ne: " << ne.size() << '\n';
-            for (size_t i = 0; i < ne.size(); i++) {
-                cerr << "src_ne[" << i << "]: " << ne[i] << '\n';
-            }
-            cerr << '\n';
-        }
-    }
-}
-
 /* tensor random utils
     refer to test-backend-ops.cpp
 */
@@ -76,7 +48,6 @@ static void debug_print_whole_json(const nlohmann::json & j) {
 #include <future>
 #include <random>
 #include <thread>
-#include <vector>
 
 static void init_tensor_uniform(ggml_tensor * tensor,
                                 float         min     = -1.0f,
@@ -312,127 +283,15 @@ static void init_tensor_uniform(ggml_tensor * tensor,
     }
 }
 
-/* unique op struct */
-struct UniqueOp {
-    ggml_op                 op_type;
-    ggml_type               node_type;
-    vector<int64_t>         op_shape;
-    vector<uint8_t>         op_param_bytes;
-    vector<ggml_type>       src_types;
-    vector<vector<int64_t>> src_nes;
-
-    void debug_print() {
-        cerr << "op_type: " << op_type << '\n';
-        cerr << "node_type: " << node_type << '\n';
-        cerr << "op_shape: " << op_shape.size() << '\n';
-        for (size_t i = 0; i < op_shape.size(); i++) {
-            cerr << "op_shape[" << i << "]: " << op_shape[i] << '\n';
-        }
-        cerr << '\n';
-        cerr << "op_param_bytes: " << op_param_bytes.size() << '\n';
-        for (size_t i = 0; i < op_param_bytes.size(); i++) {
-            cerr << "op_param_bytes[" << i << "]: " << op_param_bytes[i] << '\n';
-        }
-        cerr << '\n';
-        cerr << "src_types: " << src_types.size() << '\n';
-        for (size_t i = 0; i < src_types.size(); i++) {
-            cerr << "src_types[" << i << "]: " << src_types[i] << '\n';
-        }
-        cerr << '\n';
-        cerr << "src_nes: " << src_nes.size() << '\n';
-        for (size_t i = 0; i < src_nes.size(); i++) {
-            cerr << "src_nes[" << i << "]: " << src_nes[i].size() << '\n';
-            for (size_t j = 0; j < src_nes[i].size(); j++) {
-                cerr << "src_nes[" << i << "][" << j << "]: " << src_nes[i][j] << '\n';
-            }
-            cerr << '\n';
-        }
-        cerr << '\n';
-    }
-
-    string op_key() const {
-        string key;
-        key.reserve(256);
-        key += std::to_string((int) op_type);
-        key += "#";
-        key += std::to_string((int) node_type);
-        key += '[';
-        for (size_t i = 0; i < op_shape.size(); i++) {
-            key += ',';
-            key += std::to_string(op_shape[i]);
-        }
-        key += "]#";
-        for (size_t i = 0; i < src_types.size(); i++) {
-            key += '|';
-            key += std::to_string((int) src_types[i]);
-            key += '[';
-            for (size_t j = 0; j < src_nes[i].size(); j++) {
-                key += ',';
-                key += std::to_string(src_nes[i][j]);
-            }
-            key += ']';
-        }
-        key += '#';
-        key +=
-            base64::encode(std::string(reinterpret_cast<const char *>(op_param_bytes.data()), op_param_bytes.size()));
-        return key;
-    }
-
-    string short_desc() const {
-        string desc = string(ggml_op_name(op_type)) + ":" + string(ggml_type_name(node_type)) + "(";
-        for (size_t i = 0; i < op_shape.size(); i++) {
-            desc += to_string(op_shape[i]);
-            if (i < op_shape.size() - 1) {
-                desc += "x";
-            }
-        }
-        desc += ")";
-        return desc;
-    }
-
-    UniqueOp(const nlohmann::json & e) {
-        op_type                      = static_cast<ggml_op>(e.at("node").at("op").get<int>());
-        node_type                    = static_cast<ggml_type>(e.at("node").at("type").get<int>());
-        const auto & ne              = e.at("node").at("ne");
-        op_shape                     = vector<int64_t>(ne.begin(), ne.end());
-        string          op_param_raw = base64::decode(e.at("op_param").get<string>());
-        vector<uint8_t> op_param_bytes(op_param_raw.begin(), op_param_raw.end());
-        this->op_param_bytes = std::move(op_param_bytes);
-        const auto & srcs    = e.at("srcs");
-        for (const auto & src : srcs) {
-            src_types.push_back(static_cast<ggml_type>(src.at("type").get<int>()));
-            const auto & ne = src.at("ne");
-            src_nes.push_back(vector<int64_t>(ne.begin(), ne.end()));
-        }
-    }
-
-    UniqueOp() :
-        op_type(GGML_OP_NONE),
-        node_type(GGML_TYPE_F32),
-        op_shape(0),
-        op_param_bytes(0),
-        src_types(0),
-        src_nes(0) {}
-
-    bool operator==(const UniqueOp & other) const {
-        return op_type == other.op_type && op_shape == other.op_shape && op_param_bytes == other.op_param_bytes &&
-               src_types == other.src_types && src_nes == other.src_nes;
-    }
-
-    bool operator!=(const UniqueOp & other) const { return !(*this == other); }
-};
-
 /* single test result */
 struct SingleTestResult {
-    const UniqueOp & op;
-    ggml_backend_t   backend;
-    int              batch_size;
-    size_t           transfer_bytes;
-    double           transfer_ms;
-    double           compute_ms;
+    const pipo_unique_op & op;
+    ggml_backend_t         backend;
+    int                    batch_size;
+    double                 compute_ms;
 };
 
-static SingleTestResult run_single_test(const UniqueOp & op, ggml_backend_t backend, int batch_size, int n_iter) {
+static SingleTestResult run_single_test(const pipo_unique_op & op, ggml_backend_t backend, int batch_size, int n_iter) {
     size_t                       ctx_size    = 1024 * 1024 * 64;  // 足以容纳图节点
     struct ggml_init_params      init_params = { ctx_size, NULL, true };
     struct ggml_context *        ctx         = ggml_init(init_params);
@@ -441,15 +300,6 @@ static SingleTestResult run_single_test(const UniqueOp & op, ggml_backend_t back
     src_tensors.resize(op.src_types.size());
     for (size_t i = 0; i < op.src_types.size(); i++) {
         src_tensors[i] = ggml_new_tensor(ctx, op.src_types[i], op.src_nes[i].size(), op.src_nes[i].data());
-    }
-
-    // 用于测量传输时间
-    struct ggml_init_params      cpu_init_params = { ctx_size, NULL, true };
-    struct ggml_context *        cpu_ctx         = ggml_init(cpu_init_params);
-    vector<struct ggml_tensor *> cpu_src_tensors;
-    cpu_src_tensors.resize(op.src_types.size());
-    for (size_t i = 0; i < op.src_types.size(); i++) {
-        cpu_src_tensors[i] = ggml_new_tensor(cpu_ctx, op.src_types[i], op.src_nes[i].size(), op.src_nes[i].data());
     }
 
     // 3. 创建 result tensor
@@ -470,60 +320,32 @@ static SingleTestResult run_single_test(const UniqueOp & op, ggml_backend_t back
     if (!ggml_backend_supports_op(backend, result)) {
         cerr << "op " << op.short_desc() << " not supported by backend " << ggml_backend_name(backend) << '\n';
         ggml_free(ctx);
-        return SingleTestResult{ op, backend, batch_size, 0, -1.0, -1.0 };
+        return SingleTestResult{ op, backend, batch_size, -1.0 };
     }
 
     // 5. 后端分配
-    ggml_backend_buffer_t buffer      = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    ggml_backend_t        cpu_backend = ggml_backend_init_by_name("cpu", NULL);
-    ggml_backend_buffer_t cpu_buffer  = ggml_backend_alloc_ctx_tensors(cpu_ctx, cpu_backend);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buffer) {
         cerr << "Failed to allocate buffer for " << op.op_type << '\n';
         ggml_free(ctx);
-        return SingleTestResult{ op, backend, batch_size, 0, -1.0, -1.0 };
-    }
-    if (!cpu_buffer) {
-        cerr << "Failed to allocate buffer for " << op.op_type << '\n';
-        ggml_free(ctx);
-        ggml_free(cpu_ctx);
-        return SingleTestResult{ op, backend, batch_size, 0, -1.0, -1.0 };
+        return SingleTestResult{ op, backend, batch_size, -1.0 };
     }
 
-    // 5. 准备随机数据
-    vector<ggml_tensor *> * tensors_view;
-    if (strcmp(ggml_backend_name(backend), "CPU") == 0) {
-        tensors_view = &src_tensors;
-    } else {
-        tensors_view = &cpu_src_tensors;
-    }
     // GGML_OP_GET_ROWS 需要特殊处理, 要防止下标越界
     if (op.op_type == GGML_OP_GET_ROWS) {
-        init_tensor_uniform(tensors_view->at(0));
-        init_tensor_uniform(tensors_view->at(1), 0, 0, 0, tensors_view->at(0)->ne[1] - 1);
+        init_tensor_uniform(src_tensors.at(0));
+        init_tensor_uniform(src_tensors.at(1), 0, 0, 0, src_tensors.at(0)->ne[1] - 1);
     } else {
-        for (size_t i = 0; i < tensors_view->size(); i++) {
-            init_tensor_uniform(tensors_view->at(i));
+        for (size_t i = 0; i < src_tensors.size(); i++) {
+            init_tensor_uniform(src_tensors.at(i));
         }
     }
-
-    // 6. 传输数据
-    size_t  transfer_bytes   = 0;
-    int64_t t_transfer_start = ggml_time_us();
-    if (strcmp(ggml_backend_name(backend), "CPU") != 0) {
-        for (size_t i = 0; i < cpu_src_tensors.size(); i++) {
-            ggml_backend_tensor_copy(cpu_src_tensors[i], src_tensors[i]);
-            transfer_bytes += ggml_nbytes(src_tensors[i]);
-        }
-    }
-    ggml_backend_synchronize(backend);
-    int64_t t_transfer_end = ggml_time_us();
-    double  transfer_ms    = (t_transfer_end - t_transfer_start) / 1000.0;
 
     // warmup
     ggml_backend_graph_compute(backend, gf);
     ggml_backend_synchronize(backend);
 
-    // 7. 执行计算图
+    // 6. 执行计算图
     int64_t t_compute_start = ggml_time_us();
     for (int i = 0; i < n_iter; i++) {
         ggml_backend_graph_compute(backend, gf);
@@ -535,24 +357,77 @@ static SingleTestResult run_single_test(const UniqueOp & op, ggml_backend_t back
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    return SingleTestResult{ op, backend, batch_size, transfer_bytes, transfer_ms, compute_ms };
+    return SingleTestResult{ op, backend, batch_size, compute_ms };
 }
+static vector<string> override_stratagy(const pipo_perf_info* i, size_t free_mem){
+    // 认为 中间节点(batch_size未知) + kvcache 的大小不超过整体的 10%？
+    free_mem = free_mem * 0.90 ;
 
+    vector<pair<size_t, string>> arr;
+    size_t total_size = 0;
+    arr.reserve(i->weight_sizes.size());
+    for (auto& [name, size]: i->weight_sizes){
+        arr.emplace_back(make_pair(size, name));
+        total_size += size;
+    }
+    size_t need_override = total_size - free_mem;
+    cerr << "free_mem = " << free_mem << "; total_size = " << total_size << "; " << "need_override = " << need_override << "\n";
+
+    sort(arr.begin(), arr.end(), [](const pair<size_t, string> &a, const pair<size_t, string> &b){
+        // tensor name 的字典序，如果大小相同会把靠前的 tensor 放到主存上
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+    });
+
+    
+    vector<string> result;
+    for (auto& [size, name] : arr){
+        result.push_back(name);
+        if (size > need_override){
+            break;
+        }
+        need_override -= size;
+    } 
+    return result;
+}
+static vector<string> offload_stratgy(pipo_perf_info* i){
+    return {};
+}
 /* main */
 int main(int argc, char ** argv) {
-    if (argc != 2) {
-        cerr << "Usage: " << argv[0] << " <json_file>\n";
+    if (argc != 3) {
+        cerr << "Usage: " << argv[0] << " -m <model>\n";
         return 1;
     }
-    string           json_file = argv[1];
-    string           json_text = read_file(json_file);
-    nlohmann::json   j         = nlohmann::json::parse(json_text);  // j is an array
-    // debug_print_whole_json(j);
-    vector<UniqueOp> ops;
-    ops.resize(j.size());
-    for (size_t i = 0; i < j.size(); i++) {
-        ops[i] = UniqueOp(j[i]);
+    const char * model_path = argv[2];
+    // load backends
+    ggml_backend_load_all();
+    // load model
+    llama_model_params model_params = llama_model_default_params();
+    model_params.use_mmap           = true;
+    llama_model * model             = llama_model_load_from_file(model_path, model_params);
+
+    if (model == NULL) {
+        cerr << __func__ << ": Failed to load model\n";
+        return 1;
     }
+
+    // initialize context
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx                = 1;
+    ctx_params.n_batch              = 1;
+    ctx_params.no_perf              = true;
+
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
+
+    if (ctx == NULL) {
+        cerr << __func__ << ": Failed to create llama_context\n";
+        return 1;
+    }
+
+    auto perf_info = pipo_get_perf_info(ctx);
+
+    llama_free(ctx);
+    llama_model_free(model);
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_name("cpu", NULL);
     ggml_backend_t gpu_backend = NULL;
@@ -564,16 +439,20 @@ int main(int argc, char ** argv) {
             break;
         }
     }
-
-    vector<SingleTestResult> results;
-    for (size_t i = 0; i < ops.size(); i++) {
-        cerr << "perf op: " << ops[i].short_desc() << '\n';
-        results.push_back(run_single_test(ops[i], cpu_backend, 1, 10));
-        if (gpu_backend) {
-            results.push_back(run_single_test(ops[i], gpu_backend, 1, 10));
-        }
+    if (gpu_backend == NULL) {
+        cerr << __func__ << ": GPU backend not found\n";
+        return 1;
     }
-
+    auto &                   ops = perf_info->unique_ops;
+    vector<SingleTestResult> op_perf_results;
+    // for (auto & op : ops) {
+    //     cerr << "perf op: " << op.short_desc() << '\n';
+    //     op_perf_results.push_back(run_single_test(op, cpu_backend, 1, 20));
+    //     if (gpu_backend) {
+    //         op_perf_results.push_back(run_single_test(op, gpu_backend, 1, 50));
+    //     }
+    // }
+    /*
     // for (size_t i = 0; i < results.size(); i++) {
     //     cerr << "perf result[" << i << "]: " << ggml_backend_name(results[i].backend) << '\n';
     //     cerr << "op: " << results[i].op.short_desc() << '\n';
@@ -581,20 +460,53 @@ int main(int argc, char ** argv) {
     //     cerr << "compute_ms: " << results[i].compute_ms << '\n';
     //     cerr << '\n';
     // }
-
-    // save as json
-    nlohmann::json j_results;
-    for (size_t i = 0; i < results.size(); i++) {
-        j_results[i]["op"]     = results[i].op.op_key();
-        j_results[i]["info"]   = results[i].op.short_desc();
-        j_results[i]["result"] = {
-            { "backend",        ggml_backend_name(results[i].backend) },
-            { "transfer_bytes", results[i].transfer_bytes             },
-            { "transfer_ms",    results[i].transfer_ms                },
-            { "compute_ms",     results[i].compute_ms                 },
-        };
+    */
+    // test cpu -> gpu bandwidth
+    
+    size_t free_memory;
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
+        size_t _;
+        ggml_backend_dev_memory(dev, &free_memory, &_);
+        if (free_memory < 128 * 1024 * 1024) {
+            cerr << "Free memory on GPU is less than 128 MB, quit test\n";
+            return 1;
+        }
+        ggml_init_params init_params = { 1024 * 1024 * 10, NULL, true };
+        ggml_context *   ctx         = ggml_init(init_params);
+        size_t           tensor_size = 128 * 1024 * 1024;
+        ggml_tensor *    gpu_tensor  = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, tensor_size);
+        vector<uint8_t>  host_data(tensor_size);
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, gpu_backend);
+        if (!buffer) {
+            cerr << __FILE__ << "[" << __LINE__ << "]: Failed to allocate buffer for GPU\n";
+            return 1;
+        }
+        // warm up
+        ggml_backend_tensor_set(gpu_tensor, host_data.data(), 0, tensor_size);
+        ggml_backend_synchronize(gpu_backend);
+        double transfer_time = 0;
+        for (int i = 0; i < 5; i++) {
+            int64_t t_start = ggml_time_us();
+            ggml_backend_tensor_set(gpu_tensor, host_data.data(), 0, tensor_size);
+            ggml_backend_synchronize(gpu_backend);
+            int64_t t_end = ggml_time_us();
+            transfer_time += (t_end - t_start);
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        transfer_time /= 5;
+        perf_info->h2d_bandwidth = (double)tensor_size / transfer_time;
     }
-    cout << j_results.dump(4) << '\n';
+
+    vector<string> host_list = override_stratagy(perf_info, free_memory);
+    vector<string> offload_list = offload_stratgy(perf_info);
+    
+    nlohmann::json j;
+    j["overrides"] = host_list;
+    j["offloads"] = offload_list;
+
+    cout << j.dump(4);
 
     ggml_backend_free(cpu_backend);
     if (gpu_backend) {

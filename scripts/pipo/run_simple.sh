@@ -52,9 +52,9 @@ fi
 
 # Prepare Command Arguments
 CMD_ARGS="-m $MODEL_PATH -ngl $N_GL -n $N_PREDICT"
-# if [[ "$MODE" == "pipo" ]]; then
-#     CMD_ARGS="$CMD_ARGS -pipo"
-# fi
+if [[ "$MODE" == "pipo" ]]; then
+    CMD_ARGS="$CMD_ARGS -pipo"
+fi
 
 # Prepare Log Directory and File
 MODEL_FILENAME=$(basename "$MODEL_PATH")
