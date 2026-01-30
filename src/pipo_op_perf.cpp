@@ -150,39 +150,39 @@ pipo_unique_op::pipo_unique_op(const std::string& op_key) {
     }
     
 }
-// static std::string pipo_make_op_key(const ggml_tensor * node) {
-//     std::string key;
-//     key.reserve(256);
+std::string pipo_make_op_key(const ggml_tensor * node) {
+    std::string key;
+    key.reserve(256);
 
-//     key += std::to_string((int) node->op);
-//     key += "#";
-//     key += std::to_string((int) node->type);
-//     // the node size info
-//     key += '[';
-//     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-//         key += ',';
-//         key += std::to_string((long long) node->ne[d]);
-//     }
-//     key += "]#";
-//     for (int j = 0; j < GGML_MAX_SRC; ++j) {
-//         const ggml_tensor * src = node->src[j];
-//         if (!src) break;
+    key += std::to_string((int) node->op);
+    key += "#";
+    key += std::to_string((int) node->type);
+    // the node size info
+    key += '[';
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        key += ',';
+        key += std::to_string((long long) node->ne[d]);
+    }
+    key += "]#";
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * src = node->src[j];
+        if (!src) break;
 
-//         key += '|';
-//         key += std::to_string((int) src->type);
-//         key += '[';
-//         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-//             key += ',';
-//             key += std::to_string((long long) src->ne[d]);
-//         }
-//         key += ']';
-//     }
-//     key += '#';
-//     // key += std::string(reinterpret_cast<const char*>(node->op_params), sizeof(node->op_params));
-//     // base64 encode the op_params
-//     key += base64::encode(std::string(reinterpret_cast<const char*>(node->op_params), sizeof(node->op_params)));
-//     return key;
-// }
+        key += '|';
+        key += std::to_string((int) src->type);
+        key += '[';
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            key += ',';
+            key += std::to_string((long long) src->ne[d]);
+        }
+        key += ']';
+    }
+    key += '#';
+    // key += std::string(reinterpret_cast<const char*>(node->op_params), sizeof(node->op_params));
+    // base64 encode the op_params
+    key += base64::encode(std::string(reinterpret_cast<const char*>(node->op_params), sizeof(node->op_params)));
+    return key;
+}
 // static void pipo_op_recorder(ggml_cgraph * gf) {
 //     static std::unordered_set<std::string> seen_ops;
 //     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
@@ -210,6 +210,8 @@ pipo_unique_op::pipo_unique_op(const ggml_tensor* t):
         src_types.push_back(src->type);
         src_nes.emplace_back(src->ne, src->ne + GGML_MAX_DIMS);
     }
+    op_param_bytes.resize(sizeof(t->op_params));
+    memcpy(op_param_bytes.data(), t->op_params, sizeof(t->op_params));
 }   
 // pipo_unique_op::pipo_unique_op(const nlohmann::json & e) {
 //     op_type                      = static_cast<ggml_op>(e.at("node").at("op").get<int>());
@@ -232,6 +234,36 @@ bool pipo_unique_op::operator==(const pipo_unique_op & other) const {
            src_types == other.src_types && src_nes == other.src_nes;
 }
 
-pipo_perf_info* pipo_get_perf_info(llama_context* ctx){
-    return ctx->get_graph_info();
+pipo_graph_info* pipo_get_graph_info(llama_context* ctx, std::unordered_set<std::string>* override_tensors){
+    return ctx->get_graph_info(override_tensors);
+}
+
+bool pipo_is_view_op(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+ggml_tensor* pipo_unique_op::to_tensor(ggml_context* ctx) const{
+    struct ggml_tensor * result = ggml_new_tensor(ctx, node_type, op_shape.size(), op_shape.data());
+    result->op = op_type;
+    vector<struct ggml_tensor *> src_tensors;
+    src_tensors.resize(src_types.size());
+    for (size_t i = 0; i < src_types.size(); i++) {
+        src_tensors[i] = ggml_new_tensor(ctx, src_types[i], src_nes[i].size(), src_nes[i].data());
+    }
+    for (size_t i = 0; i < src_tensors.size(); i++) {
+        result->src[i] = src_tensors[i];
+    }
+    for (size_t i = src_tensors.size(); i < GGML_MAX_SRC; i++) {
+        result->src[i] = NULL;
+    }
+    memcpy(result->op_params, op_param_bytes.data(), op_param_bytes.size());
+    return result;
 }

@@ -3,10 +3,12 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <fstream>
+#include "../vendor/nlohmann/json.hpp"
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-pipo] [prompt]\n", argv[0]);
+    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-pipo pipo_alg_config] [prompt]\n", argv[0]);
     printf("\n");
 }
 
@@ -38,7 +40,7 @@ extern "C" {
     void dequantize_row_q6_K(const block_q6_K * x, float * y, int64_t k);
 }
 
-void dump_tensor(ggml_tensor* input){
+static void dump_tensor(ggml_tensor* input){
     // return;
     if(!input) return;
     FILE * fp = fopen("logs/input_dump.log", "a");
@@ -158,7 +160,8 @@ int main(int argc, char ** argv) {
     // number of tokens to predict
     int n_predict = 32;
     bool enable_pipo = false;
-
+    // path to pipo perf file
+    std::string pipo_alg_result_path;
     // parse command line arguments
 
     {
@@ -197,6 +200,12 @@ int main(int argc, char ** argv) {
                 }
             } else if (strcmp(argv[i], "-pipo") == 0) {
                 enable_pipo = true;
+                if (i + 1 < argc){
+                    pipo_alg_result_path = argv[++i];
+                }else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
             } else {
                 // prompt starts here
                 break;
@@ -215,7 +224,14 @@ int main(int argc, char ** argv) {
         }
     }
     // int n_cpu_layers_per_split = 0;
-
+    std::vector<std::string> overrides_list, decode_offloads_list;
+    // load alg result
+    if (enable_pipo){
+        std::ifstream conf_file(pipo_alg_result_path, std::ios_base::in);
+        auto j = nlohmann::json::parse(conf_file);
+        overrides_list.assign(j["overrides"].begin(), j["overrides"].end());
+        decode_offloads_list.assign(j["offloads"].begin(), j["offloads"].end());
+    }
     // load dynamic backends
     ggml_backend_load_all();
 
@@ -244,7 +260,12 @@ int main(int argc, char ** argv) {
                 }
             }
         }
-        pipo_tensor_layout(overrides, cuda, cuda_host);
+        // pipo_tensor_layout(overrides, cuda, cuda_host);
+        for (auto& override : overrides_list){
+            overrides.push_back({override.c_str(), cuda_host});
+        }
+        overrides.push_back({".*", cuda});
+        overrides.push_back({nullptr, nullptr});
         model_params.tensor_buft_overrides = overrides.data();
     }
 
@@ -271,7 +292,14 @@ int main(int argc, char ** argv) {
     // pre-assign op_offload
     std::vector<const char*> p_offload, d_offload;
     if(enable_pipo){
-        pipo_assign_offload(p_offload, d_offload);
+        // pipo_assign_offload(p_offload, d_offload);
+        for (auto & offload : decode_offloads_list){
+            d_offload.push_back(offload.c_str());
+        }
+        // offload all
+        for (auto& override: overrides_list){
+            p_offload.push_back(override.c_str());
+        }
         llama_model_set_offload(model, p_offload.data(), d_offload.data(), p_offload.size(), d_offload.size());
     }
 

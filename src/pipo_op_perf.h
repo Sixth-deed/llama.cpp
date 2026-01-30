@@ -33,6 +33,8 @@ struct pipo_unique_op {
 
     bool operator==(const pipo_unique_op & other) const; 
     bool operator!=(const pipo_unique_op & other) const { return !(*this == other); }
+
+    ggml_tensor* to_tensor(ggml_context* ctx)const;
 };
 namespace std{
     template <>
@@ -42,12 +44,17 @@ namespace std{
         }
     };
 }
-struct pipo_perf_info{
+struct pipo_graph_info{
     std::unordered_map<std::string, size_t> weight_sizes;
     std::unordered_set<pipo_unique_op> unique_ops;
-    size_t h2d_bandwidth;
-    pipo_perf_info() = default;
+    // byte per micro second
+    double h2d_bandwidth;
+    // 记录在计算图上被放在主存的相邻的 tensor 间的节点的计算节点。
+    std::vector<std::tuple<std::string, std::string, std::vector<std::string>> > override_tensors_interval;
+    pipo_graph_info() = default;
 };
 
-pipo_perf_info* pipo_get_perf_info(llama_context* ctx);
+pipo_graph_info* pipo_get_graph_info(llama_context* ctx, std::unordered_set<std::string>* override_tensors = nullptr);
 
+bool pipo_is_view_op(enum ggml_op op);
+std::string pipo_make_op_key(const ggml_tensor * node);

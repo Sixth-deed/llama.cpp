@@ -1128,17 +1128,7 @@ bool llama_context::apply_adapter_cvec(
 
     return cvec.apply(model, data, len, n_embd, il_start, il_end);
 }
-static bool pipo_is_view_op(enum ggml_op op) {
-    switch (op) {
-        case GGML_OP_VIEW:
-        case GGML_OP_RESHAPE:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
-            return true;
-        default:
-            return false;
-    }
-}
+
 
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -2132,7 +2122,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     return gf;
 }
-pipo_perf_info * llama_context::get_graph_info()
+pipo_graph_info * llama_context::get_graph_info(std::unordered_set<std::string>* override_tensors_ptr = nullptr)
 {
     uint32_t n_tokens = 1;
     uint32_t n_seqs = 1;
@@ -2178,44 +2168,69 @@ pipo_perf_info * llama_context::get_graph_info()
 
     this->n_outputs = save_n_outputs;
 
-    pipo_perf_info* result = new pipo_perf_info();
+    pipo_graph_info* result = new pipo_graph_info();
 
-    // tensor info
-    // input/output tensors in model are in continous field, access them as a array
-    auto it = &model.tok_embd;
-    for (; it <= &model.per_layer_proj_norm; ++it){
-        const ggml_tensor* t = *it;
-        if (t == nullptr) continue;
-        // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
-        result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
+
+    if (override_tensors_ptr != nullptr){
+        auto& override_tensors = *override_tensors_ptr;
+        auto interval_tensors = std::vector<std::string>();
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (!node) continue;
+            if (pipo_is_view_op(node->op)) continue;
+            ggml_tensor* override_src = nullptr;
+            for (ggml_tensor* src : node->src){
+                if (!src) break;
+                if (override_tensors.count(std::string(src->name))){
+                    override_src = src;
+                } 
+            }
+            if (!override_src){
+                interval_tensors.push_back(pipo_make_op_key(node));
+            }
+            else{
+                result->override_tensors_interval.push_back(std::make_tuple(std::string(override_src->name), pipo_make_op_key(node), std::move(interval_tensors)));
+            }
+        }  
     }
-    for (it = &model.dense_2_out_layers; it <= &model.dense_3_out_layers; it++){
-        const ggml_tensor* t = *it;
-        if (t == nullptr) continue;
-        // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
-        result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
-    }
-    for (const auto& layer: model.layers){
-        for (it = &layer.attn_norm; it <= &layer.ffn_act_eps; it++){
+    else{
+        // tensor info
+        // input/output tensors in model are in continous field, access them as a array
+        auto it = &model.tok_embd;
+        for (; it <= &model.per_layer_proj_norm; ++it){
             const ggml_tensor* t = *it;
             if (t == nullptr) continue;
             // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
             result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
         }
-    }
-    // op info
-    auto& seen_ops = result->unique_ops;
-    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-        ggml_tensor * node = ggml_graph_node(gf, i);
-        if (!node) continue;
+        for (it = &model.dense_2_out_layers; it <= &model.dense_3_out_layers; it++){
+            const ggml_tensor* t = *it;
+            if (t == nullptr) continue;
+            // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
+            result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
+        }
+        for (const auto& layer: model.layers){
+            for (it = &layer.attn_norm; it <= &layer.ffn_act_eps; it++){
+                const ggml_tensor* t = *it;
+                if (t == nullptr) continue;
+                // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
+                result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
+            }
+        }
+        // op info
+        auto& seen_ops = result->unique_ops;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (!node) continue;
 
-        if (pipo_is_view_op(node->op)) continue;
-        pipo_unique_op op(node);
-        if (!seen_ops.insert(op).second) continue;
-        // const std::string key = op.op_key();
-        // fprintf(stdout, "\nop_key[%zu]: ", key.size());
-        // fwrite(key.data(), 1, key.size(), stdout);
-    } 
+            if (pipo_is_view_op(node->op)) continue;
+            pipo_unique_op op(node);
+            if (!seen_ops.insert(op).second) continue;
+            // const std::string key = op.op_key();
+            // fprintf(stdout, "\nop_key[%zu]: ", key.size());
+            // fwrite(key.data(), 1, key.size(), stdout);
+        } 
+    }
     return result;
 }
 
