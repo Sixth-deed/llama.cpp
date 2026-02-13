@@ -213,6 +213,11 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
+
+set(CUDA_PATH "/usr/local/cuda-13.1")
+target_include_directories(ggml-base PRIVATE ${CUDA_PATH}/include)
+target_link_libraries(ggml-base PRIVATE dl)
+
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()

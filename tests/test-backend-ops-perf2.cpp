@@ -14,21 +14,23 @@ using namespace std;
 #include <ggml-backend.h>
 #include <ggml.h>
 
-static std::vector<std::string> escape_patterns_manual(const std::vector<std::string>& patterns) {
+#include <nvtx3/nvtx3.hpp>
+
+/*
+    Note: 疑似因为切得不整齐导致原本微秒级的算子要算毫秒级
+*/
+static std::vector<std::string> escape_patterns_manual(const std::vector<std::string> & patterns) {
     std::vector<std::string> escaped_patterns;
     escaped_patterns.reserve(patterns.size());
-    
+
     // 正则表达式特殊字符集合
-    static const std::unordered_set<char> special_chars = {
-        '.', '*', '+', '?', '^', '$',
-        '{', '}', '[', ']', '(', ')',
-        '|', '\\'
-    };
-    
-    for (const auto& pattern : patterns) {
+    static const std::unordered_set<char> special_chars = { '.', '*', '+', '?', '^', '$', '{',
+                                                            '}', '[', ']', '(', ')', '|', '\\' };
+
+    for (const auto & pattern : patterns) {
         std::string escaped;
         escaped.reserve(pattern.size() * 2 + 2);
-        escaped.push_back('^'); 
+        escaped.push_back('^');
         for (char c : pattern) {
             if (special_chars.count(c)) {
                 escaped.push_back('\\');
@@ -36,12 +38,13 @@ static std::vector<std::string> escape_patterns_manual(const std::vector<std::st
             escaped.push_back(c);
         }
         escaped.push_back('$');
-        
+
         escaped_patterns.push_back(escaped);
     }
-    
+
     return escaped_patterns;
 }
+
 /* tensor random utils
     refer to test-backend-ops.cpp
 */
@@ -300,6 +303,11 @@ struct SingleTestResult {
 };
 
 static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend, int n_iter) {
+    if (op.op_type != GGML_OP_MUL_MAT && !ggml_backend_is_cpu(backend)) {
+        return 0.0;
+    }
+
+    nvtx3::scoped_range          r{ ggml_backend_name(backend) };
     size_t                       ctx_size    = 1024 * 1024 * 64;
     struct ggml_init_params      init_params = { ctx_size, NULL, true };
     struct ggml_context *        ctx         = ggml_init(init_params);
@@ -349,11 +357,17 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
         }
     }
 
+    // duplicate the op
+    int n_runs = 10;
+    for (int i = 1; i < n_runs; i++) {
+        ggml_graph_add_node(gf, result);
+    }
     // warmup
     ggml_backend_graph_compute(backend, gf);
     ggml_backend_synchronize(backend);
 
     // 6. 执行计算图
+    n_iter                  = n_iter / n_runs;
     int64_t t_compute_start = ggml_time_us();
     for (int i = 0; i < n_iter; i++) {
         ggml_backend_graph_compute(backend, gf);
@@ -361,7 +375,7 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
     ggml_backend_synchronize(backend);
 
     int64_t t_compute_end = ggml_time_us();
-    double  compute_ms    = (t_compute_end - t_compute_start) / 1000.0 / n_iter;
+    double  compute_ms    = (t_compute_end - t_compute_start) / 1000.0 / (n_iter * n_runs);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -387,66 +401,86 @@ static vector<string> override_stratagy(const pipo_graph_info * i, size_t free_m
         // tensor name 的字典序，如果大小相同会把靠前的 tensor 放到主存上
         return a.first > b.first || (a.first == b.first && a.second < b.second);
     });
-
+    auto strhas = [](const string & s, const char * p) {
+        return strstr(s.c_str(), p) != nullptr;
+    };
     vector<string> result;
     for (auto & [size, name] : arr) {
-        result.push_back(name);
-        if (size > need_override) {
-            break;
+        if (strhas(name, "down") || strhas(name, "up") || strhas(name, "embd") || strhas(name, "output")) {
+            result.push_back(name);
+            if (size > need_override) {
+                break;
+            }
+            need_override -= size;
         }
-        need_override -= size;
     }
     return result;
 }
 
-static vector<string> offload_stratgy(const pipo_graph_info *  i, const unordered_map<string, unordered_map<string, double>>& op_perf_result, const char* cpu_backend_name_c, const char* gpu_backend_name_c, ggml_backend_t gpu_backend) {
+static vector<string> offload_stratgy(const pipo_graph_info *                                      i,
+                                      const unordered_map<string, unordered_map<string, double>> & op_perf_result,
+                                      const char *                                                 cpu_backend_name_c,
+                                      const char *                                                 gpu_backend_name_c,
+                                      ggml_backend_t                                               gpu_backend) {
     // 参数，设与 host -> cuda 并行的 cpu 计算会慢 alpha 倍
-    double alpha = 1.0;
+    double alpha = 2;
     // 设由于与cpu计算并发传输慢了多少
-    double belta = 3;
+    double belta = 2;
 
     const string cpu_backend_name(cpu_backend_name_c);
     const string gpu_backend_name(gpu_backend_name_c);
 
     // 用于构造 ggml_tensor
-    size_t                       ctx_size    = 1024 * 1024 * 64;
-    struct ggml_init_params      init_params = { ctx_size, NULL, true };
-    struct ggml_context *        ggml_ctx         = ggml_init(init_params);
-
+    size_t                  ctx_size    = 1024 * 1024 * 64;
+    struct ggml_init_params init_params = { ctx_size, NULL, true };
+    struct ggml_context *   ggml_ctx    = ggml_init(init_params);
 
     vector<string> offload_weights;
-    double time = 0;
-    for (auto& [tn, cur_node, mid_nodes]: i->override_tensors_interval){
-        for (auto& node : mid_nodes){
-            if (!op_perf_result.count(gpu_backend_name)){
-                fprintf(stderr, "%s: cpu backend result isn't initilized.", __func__);
-                continue;
+    double         time           = 0;
+    bool           last_offloaded = false;
+    for (auto & [tn, cur_node, mid_nodes] : i->override_tensors_interval) {
+        if (!last_offloaded) {
+            double tmp = 0;
+            for (auto & node : mid_nodes) {
+                if (!op_perf_result.count(gpu_backend_name)) {
+                    fprintf(stderr, "%s: gpu backend result isn't initilized.", __func__);
+                    continue;
+                }
+                if (!op_perf_result.at(gpu_backend_name).count(node)) {
+                    fprintf(stderr, "%s: gpu do not found op key %s\n", __func__, node.c_str());
+                    continue;
+                }
+                tmp += op_perf_result.at(gpu_backend_name).at(node);
             }
-            if (!op_perf_result.at(gpu_backend_name).count(node)){
-                fprintf(stderr, "%s: cpu not foune op key %s\n", __func__, node.c_str());
-                continue;
-            }
-            time += op_perf_result.at(gpu_backend_name).at(node);
-        } 
-        double transfer_time = (double)i->weight_sizes.at(tn) / i->h2d_bandwidth * belta;
+            fprintf(stderr, "gpu spent %lf ms\n", tmp);
+            time += tmp;
+        }
+        double transfer_time = (double) i->weight_sizes.at(tn) / i->h2d_bandwidth * belta;
 
-        fprintf(stderr, "Considering offload tensor %s [%lf MB]\nestimated transfer time = %lf ms, estimated async calculation time = %lf ms\n", tn.c_str(), (double)i->weight_sizes.at(tn) / 1024 / 1024, transfer_time, time);
+        fprintf(stderr,
+                "Considering offload tensor %s [%lf MB]\nestimated transfer time = %lf ms, estimated async calculation "
+                "time = %lf ms\n",
+                tn.c_str(), (double) i->weight_sizes.at(tn) / 1024 / 1024, transfer_time, time);
 
-        if (ggml_backend_supports_op(gpu_backend, pipo_unique_op(cur_node).to_tensor(ggml_ctx)) && time > transfer_time){
+        if (ggml_backend_supports_op(gpu_backend, pipo_unique_op(cur_node).to_tensor(ggml_ctx)) &&
+            time > transfer_time && strstr(tn.c_str(), "down") != nullptr) {
             offload_weights.push_back(tn);
             fprintf(stderr, "[offload]: %s\n", tn.c_str());
-            time = 0;
-        }
-        else {
-            if (!op_perf_result.count(cpu_backend_name)){
+            time           = 0;
+            last_offloaded = true;
+        } else {
+            if (!op_perf_result.count(cpu_backend_name)) {
                 fprintf(stderr, "%s: cpu backend result isn't initilized.", __func__);
                 continue;
             }
-            if (!op_perf_result.at(cpu_backend_name).count(cur_node)){
+            if (!op_perf_result.at(cpu_backend_name).count(cur_node)) {
                 fprintf(stderr, "%s: cpu not found op key %s\n", __func__, cur_node.c_str());
                 continue;
             }
-            time += op_perf_result.at(cpu_backend_name).at(cur_node) * alpha;
+            double tmp = op_perf_result.at(cpu_backend_name).at(cur_node) * alpha;
+            time += tmp;
+            fprintf(stderr, "cpu spent %lf ms\n", tmp);
+            last_offloaded = false;
         }
     }
     return offload_weights;
@@ -463,7 +497,8 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
     // load model
     llama_model_params model_params = llama_model_default_params();
-    model_params.use_mmap           = true;
+    model_params.use_mmap           = false;
+    model_params.no_alloc           = true;
     llama_model * model             = llama_model_load_from_file(model_path, model_params);
 
     if (model == NULL) {
@@ -485,12 +520,6 @@ int main(int argc, char ** argv) {
     }
 
     auto graph_info = pipo_get_graph_info(ctx);
-
-    // 为测试清理内存
-    llama_free(ctx);
-    llama_model_free(model);
-    ctx = NULL;
-    model = NULL;
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_name("cpu", NULL);
     ggml_backend_t gpu_backend = NULL;
@@ -517,7 +546,10 @@ int main(int argc, char ** argv) {
     for (auto & op : ops) {
         cerr << "perf op: " << op.short_desc() << '\n' << "key = " << op.op_key() << "\n\n";
         op_perf_results[cpu_backend_name][op.op_key()] = run_single_bench(op, cpu_backend, 20);
+        fprintf(stderr, "%s # %lf\n", cpu_backend_name, op_perf_results[cpu_backend_name][op.op_key()]);
+
         op_perf_results[gpu_backend_name][op.op_key()] = run_single_bench(op, gpu_backend, 50);
+        fprintf(stderr, "%s # %lf\n\n", gpu_backend_name, op_perf_results[gpu_backend_name][op.op_key()]);
     }
     // test cpu -> gpu bandwidth
 
@@ -541,8 +573,10 @@ int main(int argc, char ** argv) {
             return 1;
         }
         // warm up
-        ggml_backend_tensor_set(gpu_tensor, host_data.data(), 0, tensor_size);
-        ggml_backend_synchronize(gpu_backend);
+        for (int i = 0; i < 5; i++) {
+            ggml_backend_tensor_set(gpu_tensor, host_data.data(), 0, tensor_size);
+            ggml_backend_synchronize(gpu_backend);
+        }
         double transfer_time = 0;
         for (int i = 0; i < 5; i++) {
             int64_t t_start = ggml_time_us();
@@ -553,46 +587,32 @@ int main(int argc, char ** argv) {
         }
         ggml_backend_buffer_free(buffer);
         ggml_free(ctx);
-        transfer_time  = transfer_time / 5 / 1000;
+        transfer_time             = transfer_time / 5 / 1000;
         graph_info->h2d_bandwidth = (double) tensor_size / transfer_time;
     }
 
     vector<string> override_list = override_stratagy(graph_info, free_memory);
-    
+
     fprintf(stderr, "override list\n[");
-    for (auto& tn : override_list){
+    for (auto & tn : override_list) {
         fprintf(stderr, "%s, ", tn.c_str());
     }
     fprintf(stderr, "]\n");
 
     unordered_set<string> override_set(override_list.begin(), override_list.end());
 
-
-    // reinitialize context and model
-    model             = llama_model_load_from_file(model_path, model_params);
-
-    if (model == NULL) {
-        cerr << __LINE__ << ": Failed to load model\n";
-        return 1;
-    }
-    ctx = llama_init_from_model(model, ctx_params);
-
-    if (ctx == NULL) {
-        cerr << __LINE__ << ": Failed to create llama_context\n";
-        return 1;
-    }
-
     auto graph_info2 = pipo_get_graph_info(ctx, &override_set);
     llama_free(ctx);
     llama_model_free(model);
 
     graph_info2->h2d_bandwidth = graph_info->h2d_bandwidth;
-    graph_info2->weight_sizes = std::move(graph_info->weight_sizes);
+    graph_info2->weight_sizes  = std::move(graph_info->weight_sizes);
 
-    vector<string> offload_list = offload_stratgy(graph_info2, op_perf_results, cpu_backend_name, gpu_backend_name, gpu_backend);
-    
-    auto override_list_regex = escape_patterns_manual(override_list);
-    auto offload_list_regex = escape_patterns_manual(offload_list);
+    vector<string> offload_list =
+        offload_stratgy(graph_info2, op_perf_results, cpu_backend_name, gpu_backend_name, gpu_backend);
+
+    auto           override_list_regex = escape_patterns_manual(override_list);
+    auto           offload_list_regex  = escape_patterns_manual(offload_list);
     // output json result
     nlohmann::json j;
     j["overrides"] = override_list_regex;

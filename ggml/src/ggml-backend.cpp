@@ -26,6 +26,8 @@
 #include <unordered_map>
 #include <string>
 
+#include <nvtx3/nvtx3.hpp>
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -1789,8 +1791,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_async_pipo(ggml_backen
         ggml_backend_record_async_set(sched->backends[0], dynamic_tensor_cpy_events[name],
                                 list[0].second, list[0].first->data, 0, ggml_nbytes(list[0].first));
     }
+    
+    char nsys_label_buf[12] = "Split";
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        snprintf(nsys_label_buf + 5, sizeof(nsys_label_buf) - 5, "[%d]", split_id);
+        nvtx3::scoped_range r{nsys_label_buf};
+
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
