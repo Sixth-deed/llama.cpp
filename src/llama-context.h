@@ -240,7 +240,7 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
-    pipo_graph_info* get_graph_info(std::unordered_set<std::string>* override_tensors);
+    pipo_graph_info* pipo_get_graph_info(std::unordered_set<std::string>* override_tensors);
 
 private:
     llm_graph_params graph_params(

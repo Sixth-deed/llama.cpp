@@ -47,8 +47,6 @@ namespace std{
 struct pipo_graph_info{
     std::unordered_map<std::string, size_t> weight_sizes;
     std::unordered_set<pipo_unique_op> unique_ops;
-    // byte per micro second
-    double h2d_bandwidth;
     // 记录在计算图上被放在主存的相邻的 tensor 间的节点的计算节点。
     std::vector<std::tuple<std::string, std::string, std::vector<std::string>> > override_tensors_interval;
     pipo_graph_info() = default;

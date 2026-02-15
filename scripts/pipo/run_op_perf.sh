@@ -3,14 +3,22 @@ cd "$(dirname "$0")/../../" || exit 1
 
 # Defaults
 BUILD_TYPE="release"
+MODE="perf"
 MODEL_PATH="/home/hitori/code/impl_ai/model/Qwen3-14B-Q4_K_M.gguf"
-CONFIG_PATH="scripts/pipo/alg_config.json"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         release|debug)
             BUILD_TYPE="$1"
+            shift
+            ;;
+        alg)
+            MODE="alg"            
+            shift
+            ;;
+        perf)
+            MODE="perf"
             shift
             ;;
         *)
@@ -21,8 +29,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Set Binary Path
+# Set Binary Path and Output Path
 BINARY="./build-${BUILD_TYPE}/bin/test-backend-ops-perf2"
+OUTPUT_JSON="examples/pipo-alg/perf_result.json"
+if [ $MODE == "alg" ]; then
+    BINARY="./build-${BUILD_TYPE}/bin/pipo-alg"
+    OUTPUT_JSON="examples/pipo-alg/alg_config.json"
+fi
+
 
 if [[ ! -f "$BINARY" ]]; then
     echo "Error: Binary not found at $BINARY"
@@ -45,13 +59,7 @@ mkdir -p "$LOG_DIR"
 echo "Build: $BUILD_TYPE"
 echo "Executing: $BINARY $CMD_ARGS"
 echo "Logging to: $LOG_FILE"
-echo "Writting config to: $CONFIG_PATH"
+echo "Writting config to: $OUTPUT_JSON"
 
 # Execute
-# SC2086: Double quote to prevent globbing and word splitting.
-# We explicitly want splitting for CMD_ARGS here to pass as separate arguments
-$BINARY $CMD_ARGS 2> "$LOG_FILE" > $CONFIG_PATH
-
-
-
-# ./build-release/bin/test-backend-ops-perf2 -m ../model/Qwen3-14B-Q4_K_M.gguf > scripts/pipo/alg_config.json 2> logs/pipo/release/op_perf_log.log 
+$BINARY $CMD_ARGS 2> "$LOG_FILE" > "$OUTPUT_JSON"

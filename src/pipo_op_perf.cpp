@@ -235,7 +235,7 @@ bool pipo_unique_op::operator==(const pipo_unique_op & other) const {
 }
 
 pipo_graph_info* pipo_get_graph_info(llama_context* ctx, std::unordered_set<std::string>* override_tensors){
-    return ctx->get_graph_info(override_tensors);
+    return ctx->pipo_get_graph_info(override_tensors);
 }
 
 bool pipo_is_view_op(enum ggml_op op) {

@@ -1171,7 +1171,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
-        // pipo_op_recorder(gf);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2122,7 +2121,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     return gf;
 }
-pipo_graph_info * llama_context::get_graph_info(std::unordered_set<std::string>* override_tensors_ptr = nullptr)
+pipo_graph_info * llama_context::pipo_get_graph_info(std::unordered_set<std::string>* override_tensors_ptr = nullptr)
 {
     uint32_t n_tokens = 1;
     uint32_t n_seqs = 1;
@@ -2133,6 +2132,10 @@ pipo_graph_info * llama_context::get_graph_info(std::unordered_set<std::string>*
     GGML_ASSERT(n_outputs >= 1);
 
     ggml_backend_sched_reset(sched.get());
+
+    sched_reserve();
+
+    llama_memory_breakdown_print(this);
 
     // when the scheduler is reset, we cannnot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
@@ -2164,12 +2167,12 @@ pipo_graph_info * llama_context::get_graph_info(std::unordered_set<std::string>*
 
     res->reset();
 
+
     auto * gf = model.build_graph(gparams);
 
     this->n_outputs = save_n_outputs;
 
     pipo_graph_info* result = new pipo_graph_info();
-
 
     if (override_tensors_ptr != nullptr){
         auto& override_tensors = *override_tensors_ptr;
@@ -2195,27 +2198,8 @@ pipo_graph_info * llama_context::get_graph_info(std::unordered_set<std::string>*
     }
     else{
         // tensor info
-        // input/output tensors in model are in continous field, access them as a array
-        auto it = &model.tok_embd;
-        for (; it <= &model.per_layer_proj_norm; ++it){
-            const ggml_tensor* t = *it;
-            if (t == nullptr) continue;
-            // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
-            result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
-        }
-        for (it = &model.dense_2_out_layers; it <= &model.dense_3_out_layers; it++){
-            const ggml_tensor* t = *it;
-            if (t == nullptr) continue;
-            // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
-            result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
-        }
-        for (const auto& layer: model.layers){
-            for (it = &layer.attn_norm; it <= &layer.ffn_act_eps; it++){
-                const ggml_tensor* t = *it;
-                if (t == nullptr) continue;
-                // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
-                result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
-            }
+        for (const auto& [tn, t] : model.tensors_by_name){
+            result->weight_sizes[tn] = ggml_nbytes(t);
         }
         // op info
         auto& seen_ops = result->unique_ops;
