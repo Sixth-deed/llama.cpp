@@ -363,8 +363,11 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
     // duplicate the op
     int  n_runs;
     bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-    if (is_cpu) n_runs = 20;
-    else n_runs = 200; 
+    if (is_cpu) {
+        n_runs = 20;
+    } else {
+        n_runs = 200;
+    }
     for (int i = 1; i < n_runs; i++) {
         ggml_graph_add_node(gf, result);
     }
@@ -415,8 +418,18 @@ int main(int argc, char ** argv) {
         cerr << __LINE__ << ": Failed to create llama_context\n";
         return 1;
     }
-
-    auto graph_info = pipo_get_graph_info(ctx);
+    ggml_cgraph *                      model_gf = pipo_get_graph(ctx);
+    std::unordered_set<pipo_unique_op> unique_ops;
+    for (int i = 0; i < ggml_graph_n_nodes(model_gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(model_gf, i);
+        if (!node || pipo_is_view_op(node->op)) {
+            continue;
+        }
+        pipo_unique_op op(node);
+        if (!unique_ops.insert(op).second) {
+            continue;
+        }
+    }
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_name("cpu", NULL);
     ggml_backend_t gpu_backend = NULL;
@@ -432,7 +445,7 @@ int main(int argc, char ** argv) {
         cerr << __LINE__ << ": GPU backend not found\n";
         return 1;
     }
-    auto &                                               ops = graph_info->unique_ops;
+    auto &                                               ops = unique_ops;
     unordered_map<string, unordered_map<string, double>> op_perf_results;
     const char *                                         cpu_backend_name = ggml_backend_name(cpu_backend);
     op_perf_results[cpu_backend_name]                                     = unordered_map<string, double>();

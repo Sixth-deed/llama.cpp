@@ -1,6 +1,7 @@
 #include "pipo_op_perf.h"
 #include "../common/base64.hpp"
 #include "llama-context.h"
+#include "llama-memory.h"
 
 #include <iostream>
 #include <regex>
@@ -234,8 +235,11 @@ bool pipo_unique_op::operator==(const pipo_unique_op & other) const {
            src_types == other.src_types && src_nes == other.src_nes;
 }
 
-pipo_graph_info* pipo_get_graph_info(llama_context* ctx, std::unordered_set<std::string>* override_tensors){
-    return ctx->pipo_get_graph_info(override_tensors);
+ggml_cgraph* pipo_get_graph(llama_context* ctx){
+    auto mctx = ctx->get_memory()->init_full();
+    return ctx->graph_reserve(1
+        , 1
+        , 1, mctx.get(), true);
 }
 
 bool pipo_is_view_op(enum ggml_op op) {
