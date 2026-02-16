@@ -186,7 +186,63 @@ static vector<string> offload_stratgy(ggml_cgraph *                             
     }
     return offload_weights;
 }
+static pair<vector<string>, vector<string>> search_strategy(ggml_cgraph* gf, const llama_model* model, const unordered_map<string, unordered_map<string, double>> & op_perf_results, const char* _cpu_backend_name, const char* _gpu_backend_name, ggml_backend_t gpu_backend, size_t free_mem, double h2d_bandwidth)
+{
+    const string cpu_name(_cpu_backend_name);
+    const string gpu_name(_gpu_backend_name);
+    // 与传输并发的 cpu 计算慢 alpha 倍
+    const double alpha = 1.6;
+    // 与 cpu 计算并发的传输慢 belta 倍
+    const double belta = 1.0;
+    // 切换后端的惩罚
+    const double theta = 0.1;
 
+    const auto& tensors_by_name = model->tensors_by_name;
+    // node_index
+    using n_id = int;
+    // weight_index
+    using w_id = int;
+    unordered_map<n_id, w_id> n2w;
+    unordered_map<w_id, n_id> w2n;
+    {
+        unordered_map<string, w_id> w2i;
+        for (w_id i = 0; i < (int)tensors_by_name.size(); i++){
+            w2i[tensors_by_name[i].first] = i;
+        }
+        for (n_id node_id = 0; node_id < ggml_graph_n_nodes(gf); node_id += 1){
+            ggml_tensor* t = ggml_graph_node(gf, node_id);
+            for (n_id src_id = 0; src_id < GGML_MAX_SRC; src_id ++){
+                if (t->src[src_id] == nullptr) break;
+                w_id weight_id = w2i[string(t->src[src_id]->name)];
+                n2w[node_id] = weight_id;
+                w2n[weight_id] = node_id;
+            } 
+        }
+    }
+    
+    auto gpu_compute_time = [&](n_id tensor_id) -> double{
+        const ggml_tensor* t = ggml_graph_node(gf, tensor_id);
+        return op_perf_results.at(gpu_name).at(pipo_make_op_key(t));
+    };
+    auto cpu_compute_time = [&](n_id tensor_id) -> double{
+        const ggml_tensor* t = ggml_graph_node(gf, tensor_id);
+        return op_perf_results.at(cpu_name).at(pipo_make_op_key(t));
+    };
+    auto weight_size = [&](w_id tensor_id) -> double{
+        return ggml_nbytes(tensors_by_name[tensor_id].second);
+    };
+    /* dfs[free_mem][weight_index][last_offload_node] = 
+        min(
+            // override cur weight backend to gpu
+            dfs[free_mem - weight_size(weight_index)][weight_index - 1][last_offload_node] + cuda_compute_time(w2n[weight_index]),
+            // keep it on cpu
+            dfs[free_mem][weight_index - 1][last_offload_node] + cpu_compute_time(w2n[weight_index])
+            // keep its buffer on cpu but offload calculation to gpu
+            dfs[free_mem][weight_index - 1][last_offload_node] + max(max(0, transimit_estimate(weight_index) - compute_estimate(last_offload_node, w2n(weight_index))) , cuda_compute_time(w2n[weight_index]))
+            ) */
+
+    return {{}, {}};
+}
 static void print_usage(int _, char ** argv) {
     cerr << "Usage: " << argv[0] << "<model> [-r <op_perf_json>]";
     (void) _;
@@ -276,19 +332,9 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
     size_t             _;
     ggml_backend_dev_memory(dev, &free_memory, &_);
+    free_memory = free_memory * 4 / 5;
 
-    vector<string> override_list = override_stratagy(model, free_memory);
-
-    fprintf(stderr, "override list\n[");
-    for (auto & tn : override_list) {
-        fprintf(stderr, "%s, ", tn.c_str());
-    }
-    fprintf(stderr, "]\n");
-
-    unordered_set<string> override_set(override_list.begin(), override_list.end());
-
-    vector<string> offload_list = offload_stratgy(gf, model, override_set, op_perf_results, cpu_backend_name,
-                                                  gpu_backend_name, gpu_backend, h2d_bandwidth);
+    auto [override_list, offload_list] = search_strategy(gf, model, op_perf_results, cpu_backend_name, gpu_backend_name, gpu_backend, free_memory,  h2d_bandwidth);
     llama_free(ctx);
     llama_model_free(model);
 
