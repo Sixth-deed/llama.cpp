@@ -202,6 +202,8 @@ static pair<vector<string>, vector<string>> search_strategy(ggml_cgraph* gf, con
     using n_id = int;
     // weight_index
     using w_id = int;
+    // mem_bin_id
+    using b_id = int;
     unordered_map<n_id, w_id> n2w;
     unordered_map<w_id, n_id> w2n;
     {
@@ -220,16 +222,20 @@ static pair<vector<string>, vector<string>> search_strategy(ggml_cgraph* gf, con
         }
     }
     
-    auto gpu_compute_time = [&](n_id tensor_id) -> double{
-        const ggml_tensor* t = ggml_graph_node(gf, tensor_id);
+    auto gpu_compute_time = [&](n_id node_id) -> double{
+        const ggml_tensor* t = ggml_graph_node(gf, node_id);
+        if (!op_perf_results.count(gpu_name) || !op_perf_results.at(gpu_name).count(pipo_make_op_key(t)))
+            return -1;
         return op_perf_results.at(gpu_name).at(pipo_make_op_key(t));
     };
-    auto cpu_compute_time = [&](n_id tensor_id) -> double{
-        const ggml_tensor* t = ggml_graph_node(gf, tensor_id);
+    auto cpu_compute_time = [&](n_id node_id) -> double{
+        const ggml_tensor* t = ggml_graph_node(gf, node_id);
+        if (!op_perf_results.count(cpu_name) || !op_perf_results.at(cpu_name).count(pipo_make_op_key(t)))
+            return -1;
         return op_perf_results.at(cpu_name).at(pipo_make_op_key(t));
     };
-    auto weight_size = [&](w_id tensor_id) -> double{
-        return ggml_nbytes(tensors_by_name[tensor_id].second);
+    auto weight_size = [&](w_id weight_id) -> double{
+        return ggml_nbytes(tensors_by_name[weight_id].second);
     };
     /* dfs[free_mem][weight_index][last_offload_node] = 
         min(
