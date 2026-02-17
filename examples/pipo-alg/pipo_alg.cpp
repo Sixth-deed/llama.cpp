@@ -224,17 +224,22 @@ static pair<vector<string>, vector<string>> search_strategy(ggml_cgraph* gf, con
     
     auto gpu_compute_time = [&](n_id node_id) -> double{
         const ggml_tensor* t = ggml_graph_node(gf, node_id);
-        if (!op_perf_results.count(gpu_name) || !op_perf_results.at(gpu_name).count(pipo_make_op_key(t)))
-            return -1;
+        if (pipo_is_view_op(t->op)) return 0;
+        if (!op_perf_results.count(gpu_name) || !op_perf_results.at(gpu_name).count(pipo_make_op_key(t)) || op_perf_results.at(gpu_name).at(pipo_make_op_key(t)) == -1)
+            return INFINITY;
         return op_perf_results.at(gpu_name).at(pipo_make_op_key(t));
     };
     auto cpu_compute_time = [&](n_id node_id) -> double{
         const ggml_tensor* t = ggml_graph_node(gf, node_id);
-        if (!op_perf_results.count(cpu_name) || !op_perf_results.at(cpu_name).count(pipo_make_op_key(t)))
-            return -1;
+        if (pipo_is_view_op(t->op)) return 0;
+        if (!op_perf_results.count(cpu_name) || !op_perf_results.at(cpu_name).count(pipo_make_op_key(t)) || op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) == -1)
+        {
+            fprintf(stderr, "cpu not support op\n%s\n", pipo_make_op_key(t).c_str());
+            return INFINITY;
+        }
         return op_perf_results.at(cpu_name).at(pipo_make_op_key(t));
     };
-    auto weight_size = [&](w_id weight_id) -> double{
+    auto weight_size = [&](w_id weight_id) -> size_t{
         return ggml_nbytes(tensors_by_name[weight_id].second);
     };
     /* dfs[free_mem][weight_index][last_offload_node] = 
