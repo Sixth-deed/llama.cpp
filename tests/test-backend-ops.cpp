@@ -8879,8 +8879,9 @@ int main(int argc, char ** argv) {
         // bool ok = test_backend(backend, mode, op_names_filter, params_filter, output_printer.get());
         bool ok = true;
         std::vector<test_case*> my_cases;
-        my_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, 1, 17408, {1,  1}, {1, 1}, {0, 2, 1, 3}));
-        my_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 1, 5120, {1,  1}, {1, 1}, {0, 1, 2, 3}));
+        // my_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, 1, 17408, {1,  1}, {1, 1}, {0, 2, 1, 3}));
+        // my_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 1, 5120, {1,  1}, {1, 1}, {0, 1, 2, 3}));
+        my_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 40, 1, 1}));
         for (auto c : my_cases){
             c->eval_perf(backend, op_names_filter, output_printer.get()); 
         }
