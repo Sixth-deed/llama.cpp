@@ -2515,7 +2515,7 @@ bool llama_model::load_tensors_pipo(llama_model_loader & ml) {
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
     
     ggml_init_params params_dynamic = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * ml.n_tensors / n_layer + 5,
+        /*.mem_size   =*/ ggml_tensor_overhead() * ml.n_tensors,
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
