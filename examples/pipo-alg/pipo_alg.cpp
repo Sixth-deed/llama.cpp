@@ -72,7 +72,7 @@ struct BitArray {
     }
 };
 
-static pair<vector<string>, vector<string>> search_strategy(
+static pair<vector<string>, vector<string>> dp_strategy(
     ggml_cgraph *                                                gf,
     const vector<pair<string, ggml_tensor*>>&                                          tensors_by_name,
     const unordered_map<string, unordered_map<string, double>> & op_perf_results,
@@ -81,7 +81,7 @@ static pair<vector<string>, vector<string>> search_strategy(
     size_t                                                       free_mem,
     double                                                       h2d_bandwidth,
     const double                                                 alpha = 1.0,
-    const double                                                 theta = 0.1) {
+    const double                                                 theta = 0.5) {
     const string cpu_name(_cpu_backend_name);
     const string gpu_name(_gpu_backend_name);
 
@@ -462,7 +462,7 @@ int main(int argc, char ** argv) {
     const char * op_perf_result_path = "examples/pipo-alg/perf_result.json";
     const char * model_path          = nullptr;
     double       alpha               = 1.0;
-    double       theta               = 0.1;
+    double       theta               = 0.5;
     {
         int i = 1;
         for (; i < argc; i++) {
@@ -563,7 +563,7 @@ int main(int argc, char ** argv) {
     // 需要按照 graph node 顺序排序
     auto tensor_by_name = model->tensors_by_name;
     unordered_map<string, int> tensor_by_name_idx;
-    for (int i = 0; i < tensor_by_name.size(); ++i) {
+    for (int i = 0; i < (int)tensor_by_name.size(); ++i) {
         tensor_by_name_idx[tensor_by_name[i].first] = i;
     }
     unordered_map<ggml_tensor*, int> tensor_by_name_node_idx;
@@ -579,7 +579,7 @@ int main(int argc, char ** argv) {
     sort(tensor_by_name.begin(), tensor_by_name.end(), [&](const auto& a, const auto& b) {
         return tensor_by_name_node_idx[a.second] < tensor_by_name_node_idx[b.second];
     });
-    auto [override_list, offload_list] = search_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name,
+    auto [override_list, offload_list] = dp_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name,
                                                          free_memory, h2d_bandwidth, alpha, theta);
     llama_free(ctx);
     llama_model_free(model);
