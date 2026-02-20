@@ -6,7 +6,8 @@ import subprocess
 import re
 import tempfile
 import time
-from typing import Optional, List
+import json  # 新增导入
+from typing import Optional, List, Dict
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
@@ -21,8 +22,9 @@ MODEL_PATH="../model/Qwen3-14B-Q4_K_M.gguf"
 
 @dataclass
 class AlgConfig:
-    alpha = 1.0
-    theta = 0.1
+    alpha : float = 1.0
+    beta : float = 1.0
+    theta : float = 0.1
 
 @dataclass
 class AlgOutput:
@@ -47,8 +49,12 @@ class ProgressBar:
         self.current = 0
         self.start_time = time.time()
         
-    def update(self):
-        self.current += 1
+    def update(self, steps: int = 1):
+        """Update progress by specific number of steps"""
+        self.current += steps
+        if self.current > self.total:
+            self.current = self.total
+            
         elapsed = time.time() - self.start_time
         if self.current == 0:
             return
@@ -125,12 +131,13 @@ def parse_metrics(stderr_str: str) -> Optional[dict]:
     
     return metrics
 
-def single_run(alg_config : AlgConfig, n_runs: int, progress_bar: Optional[ProgressBar] = None) -> Optional[Result]:
+def single_run(alg_config : AlgConfig, n_runs: int, progress_bar: Optional[ProgressBar] = None, cache: Optional[Dict[str, Result]] = None) -> Optional[Result]:
     """
         Args:
         alg_config: the configuration of the algorithm
         n_runs: number of runs
         progress_bar: optional progress bar to update per run
+        cache: dictionary to cache results based on algorithm output hash
 
         Returns:
             A Result object containing the results of the run, or None if failed.
@@ -140,7 +147,9 @@ def single_run(alg_config : AlgConfig, n_runs: int, progress_bar: Optional[Progr
         ALG_BIN, 
         MODEL_PATH, 
         "-alpha", str(alg_config.alpha), 
-        "-theta", str(alg_config.theta)
+        "-beta", str(alg_config.beta),
+        "-theta", str(alg_config.theta),
+        # "-greedy"
     ]
     
     try:
@@ -155,14 +164,42 @@ def single_run(alg_config : AlgConfig, n_runs: int, progress_bar: Optional[Progr
         
     graph_json = pipo_proc.stdout
     
-    # 2. Create temporary file for graph config
+    # 2. Generate Cache Key (Normalized JSON)
+    # We normalize JSON to ensure whitespace differences don't cause cache misses
+    cache_key = None
+    if cache is not None:
+        try:
+            json_obj = json.loads(graph_json)
+            cache_key = json.dumps(json_obj, sort_keys=True)
+        except json.JSONDecodeError:
+            # If not valid JSON, use raw string hash
+            cache_key = graph_json
+            
+        # 3. Check Cache
+        if cache_key in cache:
+            # Cache Hit: Reuse previous result
+            cached_result = cache[cache_key]
+            # Create a new Result object with current config but cached metrics
+            res = Result(
+                total_time=cached_result.total_time,
+                total_cuda_mem=cached_result.total_cuda_mem,
+                decode_time=cached_result.decode_time,
+                prefill_time=cached_result.prefill_time,
+                alg_config=alg_config  # Update to current config for reporting
+            )
+            # Update progress bar for the skipped runs
+            if progress_bar is not None:
+                progress_bar.update(n_runs)
+            return res
+
+    # 4. Create temporary file for graph config (Only if cache miss)
     temp_file = None
     try:
         temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
         temp_file.write(graph_json)
         temp_file.close() # Close so llama-simple can open it
         
-        # 3. Run llama-simple n_runs times
+        # 5. Run llama-simple n_runs times
         collected_metrics = []
         
         for i in range(n_runs):
@@ -192,15 +229,15 @@ def single_run(alg_config : AlgConfig, n_runs: int, progress_bar: Optional[Progr
             
             # Update progress bar per run
             if progress_bar is not None:
-                progress_bar.update()
+                progress_bar.update(1)
             
-        # 4. Calculate averages
+        # 6. Calculate averages
         avg_total_time = sum(m['total_time'] for m in collected_metrics) / len(collected_metrics)
         avg_total_cuda_mem = sum(m['total_cuda_mem'] for m in collected_metrics) / len(collected_metrics)
         avg_decode_time = sum(m['decode_time'] for m in collected_metrics) / len(collected_metrics)
         avg_prefill_time = sum(m['prefill_time'] for m in collected_metrics) / len(collected_metrics)
         
-        return Result(
+        result = Result(
             total_time=avg_total_time,
             total_cuda_mem=avg_total_cuda_mem,
             decode_time=avg_decode_time,
@@ -208,33 +245,45 @@ def single_run(alg_config : AlgConfig, n_runs: int, progress_bar: Optional[Progr
             alg_config=alg_config
         )
         
+        # 7. Store in Cache
+        if cache is not None and cache_key is not None:
+            cache[cache_key] = result
+            
+        return result
+        
     finally:
-        # 5. Cleanup temp file
+        # 8. Cleanup temp file
         if temp_file and os.path.exists(temp_file.name):
             os.unlink(temp_file.name)
 
 def main():
-    alpha_list = [0.5, 0.7, 1.0, 1.2, 1.4, 1.6, 1.8]
-    theta_list = [0.4, 0.5, 0.6, 0.8, 1]
+    alpha_list = [1.0]
+    beta_list = [0.8, 1.0, 1.2, 1.3, 1.4]
+    theta_list = [0.5]
     n_runs = 5
     
     results = []
+    # Initialize Cache
+    result_cache = {}
     
     # Calculate total runs for progress bar (per run level, not per config)
-    total_iterations = len(alpha_list) * len(theta_list) * n_runs
+    total_iterations = len(alpha_list) * len(theta_list) * len(beta_list) * n_runs
     progress = ProgressBar(total_iterations)
     
     for alpha in alpha_list:
-        for theta in theta_list:
-            config = AlgConfig()
-            config.alpha = alpha
-            config.theta = theta
-            res = single_run(config, n_runs, progress_bar=progress)
-            if res is not None:
-                results.append(res)
-            else:
-                # Skip failed configs - progress already updated in single_run
-                pass
+        for beta in beta_list: 
+            for theta in theta_list:
+                config = AlgConfig()
+                config.alpha = alpha
+                config.theta = theta
+                config.beta = beta
+                
+                res = single_run(config, n_runs, progress_bar=progress, cache=result_cache)
+                if res is not None:
+                    results.append(res)
+                else:
+                    # Skip failed configs - progress already updated in single_run
+                    pass
             
     progress.finish()
     
@@ -242,7 +291,7 @@ def main():
 
     # Print results to stdout
     for r in results:
-        print(f"[alpha={r.alg_config.alpha}, theta = {r.alg_config.theta}]")
+        print(f"[alpha={r.alg_config.alpha}, beta={r.alg_config.beta}, theta = {r.alg_config.theta}]")
         print("{")
         print(f"\tDecode time per token = {r.decode_time:.2f} ms")
         print(f"\tPrefill time = {r.prefill_time:.2f} ms")
@@ -250,57 +299,6 @@ def main():
         print(f"\tTotal CUDA Mem = {r.total_cuda_mem:.2f} MiB")
         print("}")
         print("")
-    if results:
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        # 获取排序后的唯一参数值
-        unique_alphas = sorted(list(set(alpha_list)))
-        unique_thetas = sorted(list(set(theta_list)))
-        
-        # 创建参数值到等间距整数索引的映射
-        alpha_to_idx = {alpha: i for i, alpha in enumerate(unique_alphas)}
-        theta_to_idx = {theta: i for i, theta in enumerate(unique_thetas)}
-        
-        # 将原始参数值转换为等间距的整数坐标
-        x_positions = np.array([alpha_to_idx[r.alg_config.alpha] for r in results])
-        y_positions = np.array([theta_to_idx[r.alg_config.theta] for r in results])
-        decode_times = np.array([r.decode_time for r in results])
-        
-        # 设置柱子尺寸：横截面 0.7 x 0.7，相邻间距为1
-        bar_width = 0.7   # 柱子宽度
-        bar_depth = 0.7   # 柱子深度
-        
-        # 计算每个柱子的左下角坐标
-        # 柱子中心在整数位置，左下角需要偏移宽度/2
-        x_left = x_positions - bar_width / 2
-        y_left = y_positions - bar_depth / 2
-        
-        # 颜色映射
-        colors = plt.cm.viridis(decode_times / np.max(decode_times))
-        
-        # 绘制3D柱状图
-        ax.bar3d(x_left, y_left, np.zeros_like(decode_times), 
-                 bar_width, bar_depth, decode_times, 
-                 color=colors, shade=True)
-        
-        # 设置坐标轴标签
-        ax.set_xlabel('Alpha')
-        ax.set_ylabel('Theta')
-        ax.set_zlabel('Decode Time (ms)')
-        ax.set_title('Decode Time vs Alpha & Theta (3D Bar)')
-        
-        # 设置刻度：使用整数位置，标签显示原始参数值
-        ax.set_xticks(range(len(unique_alphas)))
-        ax.set_xticklabels(unique_alphas)
-        ax.set_yticks(range(len(unique_thetas)))
-        ax.set_yticklabels(unique_thetas)
-        
-        # 设置视角以获得更好的视觉效果
-        ax.view_init(elev=20, azim=45)
-        
-        plt.tight_layout()
-        plt.show() 
     
 
 if __name__ == "__main__":
