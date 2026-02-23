@@ -45,6 +45,7 @@ namespace std{
     };
 }
 ggml_cgraph* pipo_get_graph(llama_context* ctx);
+size_t pipo_get_mem_usage(llama_context* ctx);
 
 bool pipo_is_view_op(enum ggml_op op);
 std::string pipo_make_op_key(const ggml_tensor * node);

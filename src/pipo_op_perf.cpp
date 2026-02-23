@@ -242,6 +242,21 @@ ggml_cgraph* pipo_get_graph(llama_context* ctx){
         , 1, mctx.get(), true);
 }
 
+size_t pipo_get_mem_usage(llama_context* ctx){
+    auto mctx = ctx->get_memory()->init_full();
+    ctx->sched_reserve();
+    size_t result = 0;
+    auto mem_use = ctx->memory_breakdown();
+    for (auto& [buft, mb] : mem_use){
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU){
+            result += mb.compute;
+            result += mb.context;
+        }
+    }
+    return result;
+}
+
 bool pipo_is_view_op(enum ggml_op op) {
     switch (op) {
         case GGML_OP_VIEW:

@@ -6,6 +6,7 @@ BUILD_TYPE="release"
 MODE="perf"
 MODEL_PATH="/home/hitori/code/impl_ai/model/Qwen3-14B-Q4_K_M.gguf"
 ALG="dp"
+ALG_EXTRA_ARG=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -55,7 +56,7 @@ fi
 # Prepare Command Arguments
 CMD_ARGS="-m $MODEL_PATH"
 if [ $MODE == "alg" ]; then
-    CMD_ARGS="$MODEL_PATH -$ALG"
+    CMD_ARGS="$MODEL_PATH -$ALG $ALG_EXTRA_ALG"
 fi
 # Prepare Log Directory and File
 MODEL_FILENAME=$(basename "$MODEL_PATH")

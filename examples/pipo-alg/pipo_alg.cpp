@@ -83,7 +83,7 @@ static pair<vector<string>, vector<string>> dp_strategy(
     // cpu 计算实际比 perf 结果会慢 alpha 倍
     const double                                                 alpha = 1.0,
     // 传输实际慢 belta 倍
-    const double                                                 beta = 1.0,
+    const double                                                 beta  = 1.0,
     // 切换后端的惩罚，单位为毫秒
     const double                                                 theta = 0.5) {
     const string cpu_name(_cpu_backend_name);
@@ -171,7 +171,6 @@ static pair<vector<string>, vector<string>> dp_strategy(
     vector<int> weight_tt_bin(weight_cnt);
     vector<int> weight_size_bin(weight_cnt);
     int         ttf_bin_cnt = 0;
-    int         mem_bin_cnt = mem_bin(free_mem);
     for (w_id i = 0; i < weight_cnt; i++) {
         weight_tt_bin[i]   = time_bin((double) weight_size(i) / h2d_bandwidth * beta);
         ttf_bin_cnt        = max(ttf_bin_cnt, weight_tt_bin[i]);
@@ -187,276 +186,300 @@ static pair<vector<string>, vector<string>> dp_strategy(
         gpu_compute_time_cache[i] = gpu_compute_time(w2n[i]);
     }
 
-    fprintf(stderr, "[INFO] dp arr take %.4lf MB\n", (double) (ttf_bin_cnt * mem_bin_cnt * 8) / 1024.0 / 1024.0);
-    fprintf(stderr, "[INFO] dp trace arr take %.4lf MB\n",
-            (double) (weight_cnt * ttf_bin_cnt * mem_bin_cnt) * 4.375 / 1024.0 / 1024.0);
+    // 由于 mem_bin 是近似的，有可能算法实际给出的结果使用了过多的内存，需要重新跑一遍整个算法来获取有效的结果。
+    size_t actual_mem_usage;
+    // 稍微留一点余量，尽量不触发重跑
+    free_mem -= 2 * mem_bin_size;
+    int    iter     = 0;
+    int    max_iter = 10;
+    do {
+        int       mem_bin_cnt = mem_bin(free_mem);
+        const int W           = weight_cnt;
+        const int T           = ttf_bin_cnt;
+        const int M           = mem_bin_cnt;
+        auto      idx_3d      = [&](int w, int t, int m) -> size_t {
+            return ((size_t) w * T + t) * M + m;
+        };
 
-    const int W = weight_cnt;
-    const int T = ttf_bin_cnt;
-    const int M = mem_bin_cnt;
+        auto idx_2d = [&](int t, int m) -> size_t {
+            return (size_t) t * M + m;
+        };
+        fprintf(stderr, "[INFO] dp arr take %.4lf MB\n", (double) (ttf_bin_cnt * mem_bin_cnt * 8) / 1024.0 / 1024.0);
+        fprintf(stderr, "[INFO] dp trace arr take %.4lf MB\n",
+                (double) (weight_cnt * ttf_bin_cnt * mem_bin_cnt) * 4.375 / 1024.0 / 1024.0);
+        vector<double>   dp_G(T * M);
+        vector<double>   dp_C(T * M);
+        BitArray         next_on_gpu_C(W * T * M);
+        BitArray         next_on_gpu_G(W * T * M);
+        BitArray         offload(W * T * M);
+        vector<uint16_t> next_ttf_C(W * T * M, 0);
+        vector<uint16_t> next_ttf_G(W * T * M, 0);
 
-    auto idx_3d = [&](int w, int t, int m) -> size_t {
-        return ((size_t) w * T + t) * M + m;
-    };
-
-    auto idx_2d = [&](int t, int m) -> size_t {
-        return (size_t) t * M + m;
-    };
-    vector<double>   dp_G(T * M);
-    vector<double>   dp_C(T * M);
-    BitArray         next_on_gpu_C(W * T * M);
-    BitArray         next_on_gpu_G(W * T * M);
-    BitArray         offload(W * T * M);
-    vector<uint16_t> next_ttf_C(W * T * M, 0);
-    vector<uint16_t> next_ttf_G(W * T * M, 0);
-
-    w_id       progress_interval       = weight_cnt / 30;
-    const auto begin                   = ggml_time_ms();
-    auto       print_dp_progress_debug = [&](w_id wid) {
-        auto now = ggml_time_ms();
-        fprintf(stderr, "finished %d/%d weights search, taken %.2lfs.\n", weight_cnt - wid, weight_cnt,
-                      (double) (now - begin) / 1000.0);
-        fprintf(stderr, "ttf: ");
-        for (int i = 0; i < 10; i++) {
-            fprintf(stderr, "%-5d ", i);
-        }
-        fprintf(stderr, "\n# C: ");
-        for (int i = 0; i < 10; i++) {
-            fprintf(stderr, "%-5.4lg ", dp_C[idx_2d(i, mem_bin_cnt - 1)]);
-        }
-        fprintf(stderr, "\n# G: ");
-        for (int i = 0; i < 10; i++) {
-            fprintf(stderr, "%-5.4lg ", dp_G[idx_2d(i, mem_bin_cnt - 1)]);
-        }
-        fprintf(stderr, "\n");
-        fflush(stderr);
-    };
-    auto print_progress_bar = [&](int current) {
-        auto      now       = ggml_time_ms();
-        double    elapsed   = (double) (now - begin) / 1000.0;
-        const int bar_width = 50;
-        float     progress  = (float) current / weight_cnt;
-        int       pos       = (int) (bar_width * progress);
-        fprintf(stderr, "\r[");
-        for (int i = 0; i < bar_width; ++i) {
-            if (i < pos) {
-                fprintf(stderr, "=");
-            } else if (i == pos && current < weight_cnt) {
-                fprintf(stderr, ">");
-            } else {
-                fprintf(stderr, " ");
+        w_id       progress_interval       = weight_cnt / 30;
+        const auto begin                   = ggml_time_ms();
+        auto       print_dp_progress_debug = [&](w_id wid) {
+            auto now = ggml_time_ms();
+            fprintf(stderr, "finished %d/%d weights search, taken %.2lfs.\n", weight_cnt - wid, weight_cnt,
+                          (double) (now - begin) / 1000.0);
+            fprintf(stderr, "ttf: ");
+            for (int i = 0; i < 10; i++) {
+                fprintf(stderr, "%-5d ", i);
             }
-        }
-        fprintf(stderr, "] %d%% elapsed: %.2fs", (int) (progress * 100), elapsed);
-        if (current == weight_cnt) {
+            fprintf(stderr, "\n# C: ");
+            for (int i = 0; i < 10; i++) {
+                fprintf(stderr, "%-5.4lg ", dp_C[idx_2d(i, mem_bin_cnt - 1)]);
+            }
+            fprintf(stderr, "\n# G: ");
+            for (int i = 0; i < 10; i++) {
+                fprintf(stderr, "%-5.4lg ", dp_G[idx_2d(i, mem_bin_cnt - 1)]);
+            }
             fprintf(stderr, "\n");
-        }
-        fflush(stderr);
-    };
-    (void) print_dp_progress_debug;
-    (void) print_progress_bar;
-    fprintf(stderr, "dp computation level: %.4lfe9\n", (double) (weight_cnt * mem_bin_cnt * ttf_bin_cnt) / 1e9);
-    for (w_id wid = weight_cnt - 1; wid >= 0; wid--) {
-        // 当前 weight 对应的 oprand 在 cpu 上的计算时间
-        double           t_cC      = cpu_compute_time_cache[wid];
-        // 当前 weight 对应的 oprand 在 gpu 上的计算时间
-        double           t_cG      = gpu_compute_time_cache[wid];
-        // 当前 weight 与下一个 weight 之间的 oprands 在 cpu 上的计算时间
-        double           t_cmidC   = mid_node_sum_C[wid];
-        // 当前 weight 与下一个 weight 之间的 oprands 在 gpu 上的计算时间
-        double           t_cmidG   = mid_node_sum_G[wid];
-        // 当前 weight 传输所需的时间
-        int              b_t_curTf = weight_tt_bin[wid];
-        // 当前 weight 占用内存大小
-        int              b_curMem  = weight_size_bin[wid];
-        // tensor on cpu, offload compute to gpu
-        // 因为这玩意要用到完整的前一层的状态，所以第一个算
-        vector<double>   offload_time(mem_bin_cnt, INFINITY);
-        BitArray         offload_next_on_g(mem_bin_cnt);
-        vector<uint16_t> offload_next_ttf(mem_bin_cnt, 0);
-        // t_nft 这里表达的是下一个传输剩余的时间，没传完要罚时
-        for (int t_nft = 0; t_nft < ttf_bin_cnt; t_nft++) {
-            for (int mem = 0; mem < mem_bin_cnt; mem++) {
-                double t_next_C      = dp_C[idx_2d(t_nft, mem)] + theta;
-                double t_next_G      = dp_G[idx_2d(t_nft, mem)];
-                bool   cur_next_on_G = t_next_C > t_next_G;
-                double t_total       = t_cG + t_cmidG + t_nft * time_bin_size + min(t_next_C, t_next_G);
-                if (t_total < offload_time[mem]) {
-                    offload_time[mem] = t_total;
-                    offload_next_on_g.set(mem, cur_next_on_G);
-                    offload_next_ttf[mem] = t_nft;
+            fflush(stderr);
+        };
+        auto print_progress_bar = [&](int current) {
+            auto      now       = ggml_time_ms();
+            double    elapsed   = (double) (now - begin) / 1000.0;
+            const int bar_width = 50;
+            float     progress  = (float) current / weight_cnt;
+            int       pos       = (int) (bar_width * progress);
+            fprintf(stderr, "\r[");
+            for (int i = 0; i < bar_width; ++i) {
+                if (i < pos) {
+                    fprintf(stderr, "=");
+                } else if (i == pos && current < weight_cnt) {
+                    fprintf(stderr, ">");
+                } else {
+                    fprintf(stderr, " ");
                 }
             }
-        }
+            fprintf(stderr, "] %d%% elapsed: %.2fs", (int) (progress * 100), elapsed);
+            if (current == weight_cnt) {
+                fprintf(stderr, "\n");
+            }
+            fflush(stderr);
+        };
+        (void) print_dp_progress_debug;
+        (void) print_progress_bar;
+        fprintf(stderr, "dp computation level: %.4lfe9\n", (double) (weight_cnt * mem_bin_cnt * ttf_bin_cnt) / 1e9);
+        for (w_id wid = weight_cnt - 1; wid >= 0; wid--) {
+            // 当前 weight 对应的 oprand 在 cpu 上的计算时间
+            double           t_cC      = cpu_compute_time_cache[wid];
+            // 当前 weight 对应的 oprand 在 gpu 上的计算时间
+            double           t_cG      = gpu_compute_time_cache[wid];
+            // 当前 weight 与下一个 weight 之间的 oprands 在 cpu 上的计算时间
+            double           t_cmidC   = mid_node_sum_C[wid];
+            // 当前 weight 与下一个 weight 之间的 oprands 在 gpu 上的计算时间
+            double           t_cmidG   = mid_node_sum_G[wid];
+            // 当前 weight 传输所需的时间
+            int              b_t_curTf = weight_tt_bin[wid];
+            // 当前 weight 占用内存大小
+            int              b_curMem  = weight_size_bin[wid];
+            // tensor on cpu, offload compute to gpu
+            // 因为这玩意要用到完整的前一层的状态，所以第一个算
+            vector<double>   offload_time(mem_bin_cnt, INFINITY);
+            BitArray         offload_next_on_g(mem_bin_cnt);
+            vector<uint16_t> offload_next_ttf(mem_bin_cnt, 0);
+            // t_nft 这里表达的是下一个传输剩余的时间，没传完要罚时
+            for (int t_nft = 0; t_nft < ttf_bin_cnt; t_nft++) {
+                for (int mem = 0; mem < mem_bin_cnt; mem++) {
+                    double t_next_C      = dp_C[idx_2d(t_nft, mem)] + theta;
+                    double t_next_G      = dp_G[idx_2d(t_nft, mem)];
+                    bool   cur_next_on_G = t_next_C > t_next_G;
+                    double t_total       = t_cG + t_cmidG + t_nft * time_bin_size + min(t_next_C, t_next_G);
+                    if (t_total < offload_time[mem]) {
+                        offload_time[mem] = t_total;
+                        offload_next_on_g.set(mem, cur_next_on_G);
+                        offload_next_ttf[mem] = t_nft;
+                    }
+                }
+            }
 
-        int ct_G_bin = time_bin(t_cG + t_cmidG);
-        // 特判 transfer time = 0
-        for (int mem = mem_bin_cnt - 1; mem >= 0; mem--) {
-            // cur remain transfer time = 0 && cur on cpu
-            bool   next_on_gpu = false;
-            double t_nc        = INFINITY;
-            int    t_ntf_min   = 0;
-            for (int t_ntf = 0; t_ntf < min(time_bin(t_cC + t_cmidG + theta) + 1, ttf_bin_cnt); t_ntf++) {
-                if (t_nc > t_cmidG + dp_G[idx_2d(t_ntf, mem)] + theta) {
-                    t_nc        = t_cmidG + dp_G[idx_2d(t_ntf, mem)] + theta;
-                    next_on_gpu = true;
-                    t_ntf_min   = t_ntf;
-                }
-            }
-            for (int t_ntf = 0; t_ntf < min(time_bin(t_cC + t_cmidC) + 1, ttf_bin_cnt); t_ntf++) {
-                if (t_nc > t_cmidC + dp_C[idx_2d(t_ntf, mem)]) {
-                    t_nc        = t_cmidC + dp_C[idx_2d(t_ntf, mem)];
-                    next_on_gpu = false;
-                    t_ntf_min   = t_ntf;
-                }
-            }
-            dp_C[idx_2d(0, mem)] = t_cC + t_nc;
-            next_on_gpu_C.set(idx_3d(wid, 0, mem), next_on_gpu);
-            next_ttf_C[idx_3d(wid, 0, mem)] = t_ntf_min;
-            // cur remain transfer time = 0 && cur on gpu
-            t_nc                            = INFINITY;
-            next_on_gpu                     = false;
-            t_ntf_min                       = 0;
-            if (mem < b_curMem) {
-                dp_G[idx_2d(0, mem)] = INFINITY;
-                next_on_gpu_G.set(idx_3d(wid, 0, mem), false);
-                next_ttf_G[idx_3d(wid, 0, mem)] = 0;
-                continue;
-            }
-            for (int t_ntf = 0; t_ntf < min(ct_G_bin + 1, ttf_bin_cnt); t_ntf++) {
-                if (t_nc > t_cmidG + dp_G[idx_2d(t_ntf, mem - b_curMem)]) {
-                    t_nc        = t_cmidG + dp_G[idx_2d(t_ntf, mem - b_curMem)];
-                    next_on_gpu = true;
-                    t_ntf_min   = t_ntf;
-                }
-                if (t_nc > t_cmidG + dp_C[idx_2d(t_ntf, mem - b_curMem)] + theta) {
-                    t_nc        = t_cmidG + dp_C[idx_2d(t_ntf, mem - b_curMem)] + theta;
-                    next_on_gpu = false;
-                    t_ntf_min   = t_ntf;
-                }
-            }
-            dp_G[idx_2d(0, mem)] = t_cG + t_nc;
-            next_on_gpu_G.set(idx_3d(wid, 0, mem), next_on_gpu);
-            next_ttf_G[idx_3d(wid, 0, mem)] = t_ntf_min;
-        }
-        for (int t_tf = 1; t_tf < ttf_bin_cnt; t_tf++) {
+            int ct_G_bin = time_bin(t_cG + t_cmidG);
+            // 特判 transfer time = 0
             for (int mem = mem_bin_cnt - 1; mem >= 0; mem--) {
-                // cur on cpu
-                int    b_nttf_nG = t_tf + time_bin(t_cC + t_cmidG);
-                int    b_nttf_nC = t_tf + time_bin(t_cC + t_cmidC);
-                double t_next_G  = b_nttf_nG >= ttf_bin_cnt ? INFINITY : t_cmidG + dp_G[idx_2d(b_nttf_nG, mem)] + theta;
-                double t_next_C  = b_nttf_nC >= ttf_bin_cnt ? INFINITY : t_cmidC + dp_C[idx_2d(b_nttf_nC, mem)];
-
-                dp_C[idx_2d(t_tf, mem)] = t_cC + min(t_next_C, t_next_G);
-                next_on_gpu_C.set(idx_3d(wid, t_tf, mem), t_next_C > t_next_G);
-                next_ttf_C[idx_3d(wid, t_tf, mem)] = min(t_next_C > t_next_G ? b_nttf_nG : b_nttf_nC, ttf_bin_cnt - 1);
-                // cur on gpu
-                if (t_tf >= ttf_bin_cnt - ct_G_bin) {
-                    dp_G[idx_2d(t_tf, mem)] = INFINITY;
-                    next_on_gpu_G.set(idx_3d(wid, t_tf, mem), false);
-                    next_ttf_G[idx_3d(wid, t_tf, mem)] = 0;
-                    continue;
+                // cur remain transfer time = 0 && cur on cpu
+                bool   next_on_gpu = false;
+                double t_nc        = INFINITY;
+                int    t_ntf_min   = 0;
+                for (int t_ntf = 0; t_ntf < min(time_bin(t_cC + t_cmidG + theta) + 1, ttf_bin_cnt); t_ntf++) {
+                    if (t_nc > t_cmidG + dp_G[idx_2d(t_ntf, mem)] + theta) {
+                        t_nc        = t_cmidG + dp_G[idx_2d(t_ntf, mem)] + theta;
+                        next_on_gpu = true;
+                        t_ntf_min   = t_ntf;
+                    }
                 }
+                for (int t_ntf = 0; t_ntf < min(time_bin(t_cC + t_cmidC) + 1, ttf_bin_cnt); t_ntf++) {
+                    if (t_nc > t_cmidC + dp_C[idx_2d(t_ntf, mem)]) {
+                        t_nc        = t_cmidC + dp_C[idx_2d(t_ntf, mem)];
+                        next_on_gpu = false;
+                        t_ntf_min   = t_ntf;
+                    }
+                }
+                dp_C[idx_2d(0, mem)] = t_cC + t_nc;
+                next_on_gpu_C.set(idx_3d(wid, 0, mem), next_on_gpu);
+                next_ttf_C[idx_3d(wid, 0, mem)] = t_ntf_min;
+                // cur remain transfer time = 0 && cur on gpu
+                t_nc                            = INFINITY;
+                next_on_gpu                     = false;
+                t_ntf_min                       = 0;
                 if (mem < b_curMem) {
-                    dp_G[idx_2d(t_tf, mem)] = INFINITY;
-                    next_on_gpu_G.set(idx_3d(wid, t_tf, mem), false);
-                    next_ttf_G[idx_3d(wid, t_tf, mem)] = 0;
+                    dp_G[idx_2d(0, mem)] = INFINITY;
+                    next_on_gpu_G.set(idx_3d(wid, 0, mem), false);
+                    next_ttf_G[idx_3d(wid, 0, mem)] = 0;
                     continue;
                 }
-                t_next_C                = dp_C[idx_2d(t_tf + ct_G_bin, mem - b_curMem)] + theta;
-                t_next_G                = dp_G[idx_2d(t_tf + ct_G_bin, mem - b_curMem)];
-                dp_G[idx_2d(t_tf, mem)] = t_cG + mid_node_sum_G[wid] + min(t_next_C, t_next_G);
-                next_on_gpu_G.set(idx_3d(wid, t_tf, mem), t_next_C > t_next_G);
-                next_ttf_G[idx_3d(wid, t_tf, mem)] = t_tf + ct_G_bin;
-                // offload cur
-                if (t_tf == b_t_curTf && dp_G[idx_2d(t_tf, mem)] > offload_time[mem]) {
-                    dp_G[idx_2d(t_tf, mem)] = offload_time[mem];
-                    next_on_gpu_G.set(idx_3d(wid, t_tf, mem), offload_next_on_g.get(mem));
-                    next_ttf_G[idx_3d(wid, t_tf, mem)] = offload_next_ttf[mem];
-                    offload.set(idx_3d(wid, t_tf, mem), true);
+                for (int t_ntf = 0; t_ntf < min(ct_G_bin + 1, ttf_bin_cnt); t_ntf++) {
+                    if (t_nc > t_cmidG + dp_G[idx_2d(t_ntf, mem - b_curMem)]) {
+                        t_nc        = t_cmidG + dp_G[idx_2d(t_ntf, mem - b_curMem)];
+                        next_on_gpu = true;
+                        t_ntf_min   = t_ntf;
+                    }
+                    if (t_nc > t_cmidG + dp_C[idx_2d(t_ntf, mem - b_curMem)] + theta) {
+                        t_nc        = t_cmidG + dp_C[idx_2d(t_ntf, mem - b_curMem)] + theta;
+                        next_on_gpu = false;
+                        t_ntf_min   = t_ntf;
+                    }
+                }
+                dp_G[idx_2d(0, mem)] = t_cG + t_nc;
+                next_on_gpu_G.set(idx_3d(wid, 0, mem), next_on_gpu);
+                next_ttf_G[idx_3d(wid, 0, mem)] = t_ntf_min;
+            }
+            for (int t_tf = 1; t_tf < ttf_bin_cnt; t_tf++) {
+                for (int mem = mem_bin_cnt - 1; mem >= 0; mem--) {
+                    // cur on cpu
+                    int    b_nttf_nG = t_tf + time_bin(t_cC + t_cmidG);
+                    int    b_nttf_nC = t_tf + time_bin(t_cC + t_cmidC);
+                    double t_next_G =
+                        b_nttf_nG >= ttf_bin_cnt ? INFINITY : t_cmidG + dp_G[idx_2d(b_nttf_nG, mem)] + theta;
+                    double t_next_C = b_nttf_nC >= ttf_bin_cnt ? INFINITY : t_cmidC + dp_C[idx_2d(b_nttf_nC, mem)];
+
+                    dp_C[idx_2d(t_tf, mem)] = t_cC + min(t_next_C, t_next_G);
+                    next_on_gpu_C.set(idx_3d(wid, t_tf, mem), t_next_C > t_next_G);
+                    next_ttf_C[idx_3d(wid, t_tf, mem)] =
+                        min(t_next_C > t_next_G ? b_nttf_nG : b_nttf_nC, ttf_bin_cnt - 1);
+                    // cur on gpu
+                    if (t_tf >= ttf_bin_cnt - ct_G_bin) {
+                        dp_G[idx_2d(t_tf, mem)] = INFINITY;
+                        next_on_gpu_G.set(idx_3d(wid, t_tf, mem), false);
+                        next_ttf_G[idx_3d(wid, t_tf, mem)] = 0;
+                        continue;
+                    }
+                    if (mem < b_curMem) {
+                        dp_G[idx_2d(t_tf, mem)] = INFINITY;
+                        next_on_gpu_G.set(idx_3d(wid, t_tf, mem), false);
+                        next_ttf_G[idx_3d(wid, t_tf, mem)] = 0;
+                        continue;
+                    }
+                    t_next_C                = dp_C[idx_2d(t_tf + ct_G_bin, mem - b_curMem)] + theta;
+                    t_next_G                = dp_G[idx_2d(t_tf + ct_G_bin, mem - b_curMem)];
+                    dp_G[idx_2d(t_tf, mem)] = t_cG + mid_node_sum_G[wid] + min(t_next_C, t_next_G);
+                    next_on_gpu_G.set(idx_3d(wid, t_tf, mem), t_next_C > t_next_G);
+                    next_ttf_G[idx_3d(wid, t_tf, mem)] = t_tf + ct_G_bin;
+                    // offload cur
+                    if (t_tf == b_t_curTf && dp_G[idx_2d(t_tf, mem)] > offload_time[mem]) {
+                        dp_G[idx_2d(t_tf, mem)] = offload_time[mem];
+                        next_on_gpu_G.set(idx_3d(wid, t_tf, mem), offload_next_on_g.get(mem));
+                        next_ttf_G[idx_3d(wid, t_tf, mem)] = offload_next_ttf[mem];
+                        offload.set(idx_3d(wid, t_tf, mem), true);
+                    }
                 }
             }
-        }
-        if ((weight_cnt - wid) % progress_interval == 0) {
-            // print_dp_progress_debug(wid);
-            print_progress_bar(weight_cnt - wid);
-        }
-    }
-    // print_dp_progress_debug(0);
-    print_progress_bar(weight_cnt);
-    // collect result
-    vector<string> override_list;
-    vector<string> offload_list;
-
-    double min_time_total = INFINITY;
-    int    b_ttf_min      = -1;
-    bool   on_gpu_min     = false;
-    for (int t_tf = 0; t_tf < ttf_bin_cnt; t_tf++) {
-        double tf_punish = t_tf * time_bin_size;
-        if (min_time_total > tf_punish + dp_G[idx_2d(t_tf, mem_bin_cnt - 1)]) {
-            min_time_total = tf_punish + dp_G[idx_2d(t_tf, mem_bin_cnt - 1)];
-            b_ttf_min      = t_tf;
-            on_gpu_min     = true;
-        }
-        if (min_time_total > tf_punish + dp_C[idx_2d(t_tf, mem_bin_cnt - 1)]) {
-            min_time_total = tf_punish + dp_C[idx_2d(t_tf, mem_bin_cnt - 1)];
-            b_ttf_min      = t_tf;
-            on_gpu_min     = false;
-        }
-    }
-
-    fprintf(stderr, "dp alg estimated decode batch time = %.4lf\n", min_time_total);
-    bool     cur_on_gpu = on_gpu_min;
-    uint16_t cur_ttf    = b_ttf_min;
-    int      cur_mem    = mem_bin_cnt - 1;
-
-    auto op_short_desc = [&gf](n_id node_id) -> string {
-        return pipo_unique_op(ggml_graph_node(gf, node_id)).short_desc();
-    };
-
-    for (w_id i = 0; i < weight_cnt; i++) {
-        bool     next_on_gpu_val = false;
-        uint16_t next_ttf_val    = 0;
-        int      next_mem_val    = cur_mem;
-        size_t   idx             = idx_3d(i, cur_ttf, cur_mem);
-        if (cur_ttf >= ttf_bin_cnt || cur_mem >= mem_bin_cnt || cur_mem < 0) {
-            fprintf(stderr, "when tracing weight %d, cur_ttf = %d, cur_mem = %d, out of range\n", i, cur_ttf, cur_mem);
-            return { {}, {} };
-        }
-        if (!cur_on_gpu) {
-            override_list.push_back(tensors_by_name[i].first);
-            next_on_gpu_val = next_on_gpu_C.get(idx);
-            next_ttf_val    = next_ttf_C[idx];
-
-            fprintf(stderr, "%s ON CPU\nNode Op: %s\nEstimated time = %.4lf\nMidNodes: [\n",
-                    tensors_by_name[i].first.c_str(), op_short_desc(w2n[i]).c_str(), cpu_compute_time_cache[i]);
-            for (n_id j = w2n[i] + 1; j < (i == weight_cnt - 1 ? ggml_graph_n_nodes(gf) : w2n[i + 1]); j++) {
-                fprintf(stderr, "\t%s\n", op_short_desc(j).c_str());
+            if ((weight_cnt - wid) % progress_interval == 0) {
+                // print_dp_progress_debug(wid);
+                print_progress_bar(weight_cnt - wid);
             }
-            fprintf(stderr, "]\nEstimated time = %.4lf\n\n", next_on_gpu_val ? mid_node_sum_G[i] : mid_node_sum_C[i]);
-        } else {
-            next_on_gpu_val = next_on_gpu_G.get(idx);
-            next_ttf_val    = next_ttf_G[idx];
-            next_mem_val    = cur_mem - weight_size_bin[i];
-            if (offload.get(idx)) {
-                next_mem_val = cur_mem;
+        }
+        // print_dp_progress_debug(0);
+        print_progress_bar(weight_cnt);
+        // collect result
+        vector<string> override_list;
+        vector<string> offload_list;
+
+        double min_time_total = INFINITY;
+        int    b_ttf_min      = -1;
+        bool   on_gpu_min     = false;
+        for (int t_tf = 0; t_tf < ttf_bin_cnt; t_tf++) {
+            double tf_punish = t_tf * time_bin_size;
+            if (min_time_total > tf_punish + dp_G[idx_2d(t_tf, mem_bin_cnt - 1)]) {
+                min_time_total = tf_punish + dp_G[idx_2d(t_tf, mem_bin_cnt - 1)];
+                b_ttf_min      = t_tf;
+                on_gpu_min     = true;
+            }
+            if (min_time_total > tf_punish + dp_C[idx_2d(t_tf, mem_bin_cnt - 1)]) {
+                min_time_total = tf_punish + dp_C[idx_2d(t_tf, mem_bin_cnt - 1)];
+                b_ttf_min      = t_tf;
+                on_gpu_min     = false;
+            }
+        }
+
+        fprintf(stderr, "dp alg estimated decode batch time = %.4lf\n", min_time_total);
+        bool     cur_on_gpu = on_gpu_min;
+        uint16_t cur_ttf    = b_ttf_min;
+        int      cur_mem    = mem_bin_cnt - 1;
+        actual_mem_usage    = 0;
+
+        auto op_short_desc = [&gf](n_id node_id) -> string {
+            return pipo_unique_op(ggml_graph_node(gf, node_id)).short_desc();
+        };
+
+        for (w_id i = 0; i < weight_cnt; i++) {
+            bool     next_on_gpu_val = false;
+            uint16_t next_ttf_val    = 0;
+            int      next_mem_val    = cur_mem;
+            size_t   idx             = idx_3d(i, cur_ttf, cur_mem);
+            if (cur_ttf >= ttf_bin_cnt || cur_mem >= mem_bin_cnt || cur_mem < 0) {
+                fprintf(stderr, "when tracing weight %d, cur_ttf = %d, cur_mem = %d, out of range\n", i, cur_ttf,
+                        cur_mem);
+                return { {}, {} };
+            }
+            if (!cur_on_gpu) {
                 override_list.push_back(tensors_by_name[i].first);
-                offload_list.push_back(tensors_by_name[i].first);
-                fprintf(stderr, "## OFFLOAD ##\n");
-            }
+                next_on_gpu_val = next_on_gpu_C.get(idx);
+                next_ttf_val    = next_ttf_C[idx];
 
-            fprintf(stderr, "%s ON GPU\nNode Op: %s\nEstimated time = %.4lf\nMidNodes: [\n",
-                    tensors_by_name[i].first.c_str(), op_short_desc(w2n[i]).c_str(), gpu_compute_time_cache[i]);
-            for (n_id j = w2n[i] + 1; j < (i == weight_cnt - 1 ? ggml_graph_n_nodes(gf) : w2n[i + 1]); j++) {
-                fprintf(stderr, "\t%s\n", op_short_desc(j).c_str());
+                fprintf(stderr, "%s ON CPU\nNode Op: %s\nEstimated time = %.4lf\nMidNodes: [\n",
+                        tensors_by_name[i].first.c_str(), op_short_desc(w2n[i]).c_str(), cpu_compute_time_cache[i]);
+                for (n_id j = w2n[i] + 1; j < (i == weight_cnt - 1 ? ggml_graph_n_nodes(gf) : w2n[i + 1]); j++) {
+                    fprintf(stderr, "\t%s\n", op_short_desc(j).c_str());
+                }
+                fprintf(stderr, "]\nEstimated time = %.4lf\n\n",
+                        next_on_gpu_val ? mid_node_sum_G[i] : mid_node_sum_C[i]);
+            } else {
+                next_on_gpu_val = next_on_gpu_G.get(idx);
+                next_ttf_val    = next_ttf_G[idx];
+                next_mem_val    = cur_mem - weight_size_bin[i];
+                actual_mem_usage += weight_size(i);
+                if (offload.get(idx)) {
+                    next_mem_val = cur_mem;
+                    actual_mem_usage -= weight_size(i);
+                    override_list.push_back(tensors_by_name[i].first);
+                    offload_list.push_back(tensors_by_name[i].first);
+                    fprintf(stderr, "## OFFLOAD ##\n");
+                }
+
+                fprintf(stderr, "%s ON GPU\nNode Op: %s\nEstimated time = %.4lf\nMidNodes: [\n",
+                        tensors_by_name[i].first.c_str(), op_short_desc(w2n[i]).c_str(), gpu_compute_time_cache[i]);
+                for (n_id j = w2n[i] + 1; j < (i == weight_cnt - 1 ? ggml_graph_n_nodes(gf) : w2n[i + 1]); j++) {
+                    fprintf(stderr, "\t%s\n", op_short_desc(j).c_str());
+                }
+                fprintf(stderr, "]\nEstimated time = %.4lf\n\n", mid_node_sum_G[i]);
             }
-            fprintf(stderr, "]\nEstimated time = %.4lf\n\n", mid_node_sum_G[i]);
+            cur_on_gpu = next_on_gpu_val;
+            cur_ttf    = next_ttf_val;
+            cur_mem    = next_mem_val;
         }
-        cur_on_gpu = next_on_gpu_val;
-        cur_ttf    = next_ttf_val;
-        cur_mem    = next_mem_val;
-    }
-    return { override_list, offload_list };
+        if (actual_mem_usage <= free_mem) {
+            return { override_list, offload_list };
+        }
+        size_t new_target_mem = free_mem - (actual_mem_usage - free_mem);
+        fprintf(stderr,
+                "alg actual provide strategy with mem use of %ld bytes, but target memory usage is %ld bytes.\nRerun "
+                "alg with new target mem = %ld\n",
+                actual_mem_usage, free_mem, new_target_mem);
+        iter += 1;
+    } while (iter < max_iter);
+    fprintf(stderr, "alg failed to find a strategy with max_retires = %d\n", max_iter);
+    return { {}, {} };
 }
 
 static pair<vector<string>, vector<string>> greedy_strategy(
@@ -470,7 +493,7 @@ static pair<vector<string>, vector<string>> greedy_strategy(
     // 与传输并发的 cpu 计算慢 alpha 倍
     const double                                                 alpha = 1.0,
     // 与 cpu 计算并发的传输慢 belta 倍
-    const double                                                 beta = 1.0,
+    const double                                                 beta  = 1.0,
     // 调整优先级中 权重大小/计算时间收益 的比重，越大权重大小越重要
     const double                                                 theta = 1.0) {
     const string cpu_name(_cpu_backend_name);
@@ -503,7 +526,7 @@ static pair<vector<string>, vector<string>> greedy_strategy(
         }
     }
 
-        auto gpu_compute_time = [&](n_id node_id) -> double {
+    auto gpu_compute_time = [&](n_id node_id) -> double {
         const ggml_tensor * t = ggml_graph_node(gf, node_id);
         if (pipo_is_view_op(t->op)) {
             return 0;
@@ -577,7 +600,7 @@ static pair<vector<string>, vector<string>> greedy_strategy(
         fprintf(stderr, "\n\t%s,", tn.c_str());
     }
     fprintf(stderr, "\n]\n");
-    
+
     // offload with dp
     vector<string> offload_list;
     {
@@ -661,12 +684,321 @@ static pair<vector<string>, vector<string>> greedy_strategy(
         }
         fprintf(stderr, "offload estimate gain = %lf\n", min_gain);
     }
-   return { std::move(override_list), std::move(offload_list) };
+    return { std::move(override_list), std::move(offload_list) };
 }
 
+static pair<vector<string>, vector<string>> lagrangian_strategy(
+    ggml_cgraph *                                                gf,
+    const vector<pair<string, ggml_tensor *>> &                  tensors_by_name,
+    const unordered_map<string, unordered_map<string, double>> & op_perf_results,
+    const char *                                                 _cpu_backend_name,
+    const char *                                                 _gpu_backend_name,
+    size_t                                                       free_mem,
+    double                                                       h2d_bandwidth,
+    // 与传输并发的 cpu 计算慢 alpha 倍
+    const double                                                 alpha = 1.0,
+    // 与 cpu 计算并发的传输慢 belta 倍
+    const double                                                 beta  = 1.0) {
+    const string cpu_name(_cpu_backend_name);
+    const string gpu_name(_gpu_backend_name);
+
+    // node_index
+    using n_id = int;
+    // weight_index
+    using w_id = int;
+    unordered_map<n_id, w_id> n2w;
+    unordered_map<w_id, n_id> w2n;
+    {
+        unordered_map<string, w_id> w2i;
+        for (w_id i = 0; i < (int) tensors_by_name.size(); i++) {
+            w2i[tensors_by_name[i].first] = i;
+        }
+        for (n_id node_id = 0; node_id < ggml_graph_n_nodes(gf); node_id += 1) {
+            ggml_tensor * t = ggml_graph_node(gf, node_id);
+            for (n_id src_id = 0; src_id < GGML_MAX_SRC; src_id++) {
+                if (t->src[src_id] == nullptr) {
+                    break;
+                }
+                if (!w2i.count(string(t->src[src_id]->name))) {
+                    continue;
+                }
+                w_id weight_id = w2i[string(t->src[src_id]->name)];
+                n2w[node_id]   = weight_id;
+                w2n[weight_id] = node_id;
+            }
+        }
+    }
+
+    auto gpu_compute_time = [&](n_id node_id) -> double {
+        const ggml_tensor * t = ggml_graph_node(gf, node_id);
+        if (pipo_is_view_op(t->op)) {
+            return 0;
+        }
+        if (!op_perf_results.count(gpu_name) || !op_perf_results.at(gpu_name).count(pipo_make_op_key(t)) ||
+            op_perf_results.at(gpu_name).at(pipo_make_op_key(t)) == -1) {
+            return INFINITY;
+        }
+        return op_perf_results.at(gpu_name).at(pipo_make_op_key(t));
+    };
+    auto cpu_compute_time = [&](n_id node_id) -> double {
+        const ggml_tensor * t = ggml_graph_node(gf, node_id);
+        if (pipo_is_view_op(t->op)) {
+            return 0;
+        }
+        if (!op_perf_results.count(cpu_name) || !op_perf_results.at(cpu_name).count(pipo_make_op_key(t)) ||
+            op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) == -1) {
+            fprintf(stderr, "cpu not support op\n%s\n", pipo_make_op_key(t).c_str());
+            return INFINITY;
+        }
+        return op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) * alpha;
+    };
+    auto weight_size = [&](w_id weight_id) -> size_t {
+        return ggml_nbytes(tensors_by_name[weight_id].second);
+    };
+    const w_id weight_cnt = tensors_by_name.size();
+
+    // --- 3. 预计算每个权重块 (Weight + MidNodes) 的总耗时 ---
+    vector<double> block_cpu_time(weight_cnt, 0.0);
+    vector<double> block_gpu_time(weight_cnt, 0.0);
+    vector<size_t> block_mem_size(weight_cnt, 0);
+    vector<bool>   gpu_unsupported(weight_cnt, false);
+
+    for (w_id i = 0; i < weight_cnt; i++) {
+        n_id l = w2n[i] + 1;
+        n_id r = i == weight_cnt - 1 ? ggml_graph_n_nodes(gf) : w2n[i + 1];
+        
+        // 当前权重节点
+        double t_c = cpu_compute_time(w2n[i]);
+        double t_g = gpu_compute_time(w2n[i]);
+        if (t_g == INFINITY) gpu_unsupported[i] = true;
+
+        block_mem_size[i] = weight_size(i);
+        block_cpu_time[i] += t_c;
+        block_gpu_time[i] += t_g;
+
+        // 中间节点
+        for (n_id j = l; j < r; j++) {
+            block_cpu_time[i] += cpu_compute_time(j);
+            block_gpu_time[i] += gpu_compute_time(j);
+        }
+    }
+    // 初始化随机数 (固定种子保证可复现)
+    unsigned int rand_state = 42;
+    auto random_double = [&rand_state]() -> double {
+        rand_state = rand_state * 1664525 + 1013904223;
+        return (double)(rand_state % 100000) / 1e8;
+    };
+    // --- 4. 拉格朗日评估函数 ---
+    // 输入 lambda (每字节的显存惩罚时间 ms/byte)
+    // 输出：{总预估时间，总显存占用，CPU 放置列表}
+    auto evaluate = [&](double lambda) -> tuple<double, size_t, vector<bool>> {
+        double total_time = 0;
+        size_t total_mem  = 0;
+        vector<bool> is_on_cpu(weight_cnt, false);
+
+        for (w_id i = 0; i < weight_cnt; i++) {
+            if (gpu_unsupported[i]) {
+                // 必须上 CPU
+                is_on_cpu[i] = true;
+                total_time += block_cpu_time[i];
+                continue;
+            }
+
+            // 拉格朗日成本函数
+            // Cost_CPU = Time_CPU
+            // Cost_GPU = Time_GPU + Transfer_Time + Lambda * Memory
+            double cost_cpu = block_cpu_time[i] + random_double();
+            double cost_gpu = block_gpu_time[i] + lambda * (double)block_mem_size[i] + random_double();
+
+            if (cost_cpu <= cost_gpu) {
+                is_on_cpu[i] = true;
+                total_time += cost_cpu; 
+                // 注意：这里 total_time 累加的是实际物理时间，不是 cost
+            } else {
+                is_on_cpu[i] = false;
+                total_time += (block_gpu_time[i]);
+                total_mem += block_mem_size[i];
+            }
+        }
+        return {total_time, total_mem, is_on_cpu};
+    };
+
+    // --- 5. 二分搜索 Lambda ---
+    // Lambda 含义：1 byte 显存等价于多少毫秒的计算时间
+    // 下界 0 (显存免费), 上界设为一个足够大的值 (例如 1ms/KB)
+    double lambda_low = 0.0;
+    double lambda_high = 1e-6; // 初始上界，动态调整
+    vector<bool> best_placement(weight_cnt, true); // 默认全 CPU
+    double       best_time = INFINITY;
+    size_t       best_mem  = 0;
+    
+    // 先探测一个足够大的 high
+    auto [t_init, m_init, _] = evaluate(lambda_high);
+    while (m_init > free_mem && lambda_high < 1e-2) {
+        lambda_high *= 10;
+        tie(t_init, m_init, _) = evaluate(lambda_high);
+    }
+
+    fprintf(stderr, "[Lagrangian] Search lambda range: [%.2e, %.2e] ms/byte\n", lambda_low, lambda_high);
+
+    // 记录每次决策变化的 lambda 点
+    int iterations = 60;
+    size_t last_mem = SIZE_MAX;
+    int unchanged_count = 0;
+    
+    for (int iter = 0; iter < iterations; iter++) {
+        double lambda_mid = lambda_low + (lambda_high - lambda_low) * 0.5;
+        auto [cur_time, cur_mem, placement] = evaluate(lambda_mid);
+
+        if (cur_mem <= free_mem) {
+            lambda_high = lambda_mid;
+            if (cur_time < best_time || (cur_time == best_time && cur_mem > best_mem)) {
+                best_time = cur_time;
+                best_mem = cur_mem;
+                best_placement = placement;
+            }
+            // 检测是否陷入平台区
+            if (cur_mem == last_mem) {
+                unchanged_count++;
+                if (unchanged_count > 5) break; // 提前退出
+            } else {
+                unchanged_count = 0;
+            }
+            last_mem = cur_mem;
+        } else {
+            lambda_low = lambda_mid;
+            unchanged_count = 0;
+        }
+        if (iter % 10 == 0){
+            fprintf(stderr, "iter[%d]: lambda in [%6le, %6le]\n", iter, lambda_low, lambda_high);
+        }
+    }
+
+
+    // --- 6. 生成结果与日志 ---
+    vector<string> override_list;
+    for (w_id i = 0; i < weight_cnt; i++) {
+        if (best_placement[i]) {
+            override_list.push_back(tensors_by_name[i].first);
+        }
+    }
+
+    // 可解释性日志
+    double shadow_price = lambda_high; // 最终的 lambda 近似值
+    fprintf(stderr, "\n========== Lagrangian Strategy Result ==========\n");
+    fprintf(stderr, "Shadow Price (Lambda): %.6lf ms/MB\n", shadow_price * 1024.0 * 1024.0);
+    fprintf(stderr, "Estimated Total Time:  %.4lf ms\n", best_time);
+    fprintf(stderr, "Estimated VRAM Usage:  %.2lf MB / %.2lf MB\n", 
+            (double)best_mem / 1024.0 / 1024.0, (double)free_mem / 1024.0 / 1024.0);
+    fprintf(stderr, "CPU Override Count:    %d / %d\n", (int)override_list.size(), weight_cnt);
+    
+    if (shadow_price * 1024.0 * 1024.0 < 0.01) {
+        fprintf(stderr, "[Hint] VRAM is abundant. Lambda is near 0.\n");
+    } else if (shadow_price * 1024.0 * 1024.0 > 10.0) {
+        fprintf(stderr, "[Hint] VRAM is extremely tight. Each MB costs >10ms.\n");
+    }
+    fprintf(stderr, "===============================================\n\n");
+
+    // offload with dp
+    vector<string> offload_list;
+    {
+        unordered_set<string> override_set(override_list.begin(), override_list.end());
+        w_id                  weight_cnt    = tensors_by_name.size();
+        auto                  transfer_time = [&](w_id weight_id) -> double {
+            return (double) weight_size(weight_id) / h2d_bandwidth * beta;
+        };
+        // 每一个带权重节点自身计算时间与它之前的带权重节点间的节点计算时间之和
+        vector<double> computation_internal(weight_cnt, 0);
+        n_id           prev        = 0;
+        bool           prev_on_gpu = false;
+        for (w_id i = 0; i < weight_cnt; i++) {
+            n_id cur        = w2n[i];
+            bool cur_on_gpu = override_set.count(tensors_by_name[i].first);
+            if (cur_on_gpu) {
+                computation_internal[i] += gpu_compute_time(cur);
+            } else {
+                computation_internal[i] += cpu_compute_time(cur);
+            }
+            for (n_id j = prev; j < cur; j++) {
+                if (cur_on_gpu || prev_on_gpu) {
+                    computation_internal[i] += gpu_compute_time(j);
+                } else {
+                    computation_internal[i] += cpu_compute_time(j);
+                }
+            }
+            prev        = cur;
+            prev_on_gpu = cur_on_gpu;
+        }
+
+        auto computation_between = [&](w_id l, w_id r) -> double {
+            double result = 0;
+            for (w_id i = l + 1; i < r; i++) {
+                result += computation_internal[i];
+            }
+            return result;
+        };
+        // offload tensor 带来的时间差，使总计算时间时间减少时为负。越小越好
+        vector<double> offload_gain(weight_cnt, INFINITY);
+        vector<w_id>   offload_prev(weight_cnt, -1);
+        offload_gain[0] = gpu_compute_time(w2n[0]) + transfer_time(0) - cpu_compute_time(w2n[0]);
+        for (w_id cur = 1; cur < weight_cnt; cur++) {
+            if (!override_set.count(tensors_by_name[cur].first)) {
+                continue;
+            }
+            offload_gain[cur] =
+                gpu_compute_time(w2n[cur]) - cpu_compute_time(w2n[cur]) +
+                max((alpha - 1) * transfer_time(cur), transfer_time(cur) - computation_between(-1, cur));
+            for (w_id prev = 0; prev < cur; prev++) {
+                if (!override_set.count(tensors_by_name[prev].first)) {
+                    continue;
+                }
+                double offload_cur_gain =
+                    offload_gain[prev] + gpu_compute_time(w2n[cur]) - cpu_compute_time(w2n[cur]) +
+                    max((alpha - 1) * transfer_time(cur), transfer_time(cur) - computation_between(prev, cur));
+#if 0
+                fprintf(stderr, "cur = %d, prev = %d, gain = %lf compare to %lf\n", cur, prev, offload_cur_gain, offload_gain[cur]);
+                if (strstr(tensors_by_name[cur].first.c_str(), "ffn_up") || strstr(tensors_by_name[cur].first.c_str(), "ffn_gate")){
+                    fprintf(stderr, "%s: pgain=%.4lf, gt=%.4lf, ct=%.4lf, tt=%.4lf, it=%.4lf\n", tensors_by_name[cur].first.c_str(), offload_gain[prev],  gpu_compute_time(w2n[cur]), cpu_compute_time(w2n[cur]), 
+                    transfer_time(cur), computation_between(prev, cur));
+                }
+#endif
+                if (offload_cur_gain < offload_gain[cur]) {
+                    offload_gain[cur] = offload_cur_gain;
+                    offload_prev[cur] = prev;
+                }
+            }
+        }
+        double min_gain = INFINITY;
+        w_id   min_last = -1;
+        for (w_id i = 0; i < weight_cnt; i++) {
+            if (min_gain > offload_gain[i]) {
+                min_gain = offload_gain[i];
+                min_last = i;
+            }
+        }
+        while (min_last != -1) {
+            offload_list.push_back(tensors_by_name[min_last].first);
+            min_last = offload_prev[min_last];
+        }
+        fprintf(stderr, "offload estimate gain = %lf\n", min_gain);
+    }
+    return { std::move(override_list), std::move(offload_list) };
+}
 static void print_usage(int _, char ** argv) {
-    cerr << "Usage: " << argv[0] << "<model> [-r <op_perf_json>]";
-    (void) _;
+    (void)_;
+    cerr << "Usage: " << argv[0] << " <model_file> [options]\n\n";
+    cerr << "Options:\n";
+    cerr << "  -r <op_perf_json>    Path to operator performance result JSON file (default: examples/pipo-alg/perf_result.json)\n";
+    cerr << "  -alpha <float>       Alpha parameter for the algorithm (default depends on algorithm)\n";
+    cerr << "  -beta <float>        Beta parameter for the algorithm (default depends on algorithm)\n";
+    cerr << "  -theta <float>       Theta parameter for the algorithm (default depends on algorithm)\n";
+    cerr << "  -dp                  Use dynamic programming algorithm (default)\n";
+    cerr << "  -greedy              Use greedy algorithm\n";
+    cerr << "  -max-n <int>         Maximum context length, mainly affects KV cache size (default: 200)\n";
+    cerr << "  -max-batch <int>     Maximum batch length, depends on prefill run (default: 100)\n\n";
+    cerr << "Default parameter values:\n";
+    cerr << "  When using DP algorithm (-dp):    alpha=1.0, beta=1.0, theta=0.5\n";
+    cerr << "  When using Greedy algorithm:      alpha=1.0, beta=1.4, theta=1.25\n";
 }
 
 int main(int argc, char ** argv) {
@@ -675,7 +1007,12 @@ int main(int argc, char ** argv) {
     double       alpha               = -1.0;
     double       beta                = -1.0;
     double       theta               = -1.0;
+    // use dp algorithm, otherwise greedy
     bool         use_dp              = true;
+    // model context len, mainly affect kv cache size
+    int          max_ctx_len         = 200;
+    // depend on the prefill run
+    int          max_batch_len       = 100;
     {
         int i = 1;
         for (; i < argc; i++) {
@@ -711,7 +1048,25 @@ int main(int argc, char ** argv) {
                 use_dp = true;
             } else if (strcmp(argv[i], "-greedy") == 0) {
                 use_dp = false;
-            } else {
+            } else if (strcmp(argv[i], "-max-n") == 0){
+                if (i + 1 < argc){
+                    max_ctx_len = atoi(argv[++i]);
+                }
+                else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } 
+            else if (strcmp(argv[i], "-max-batch") == 0){
+                if (i + 1 < argc){
+                    max_batch_len = atoi(argv[++i]);
+                }
+                else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } 
+            else {
                 model_path = argv[i];
             }
         }
@@ -721,14 +1076,13 @@ int main(int argc, char ** argv) {
         }
     }
     // default params
-    if (use_dp){
+    if (use_dp) {
         alpha = alpha < 0 ? 1.0 : alpha;
-        beta = beta < 0 ? 1.0 : beta;
+        beta  = beta < 0 ? 1.0 : beta;
         theta = theta < 0 ? 0.5 : theta;
-    }
-    else{
+    } else {
         alpha = alpha < 0 ? 1.0 : alpha;
-        beta = beta < 0 ? 1.4 : beta;
+        beta  = beta < 0 ? 1.4 : beta;
         theta = theta < 0 ? 1.25 : theta;
     }
     ifstream                                             _op_perf_result_s(op_perf_result_path, ios::in);
@@ -756,8 +1110,8 @@ int main(int argc, char ** argv) {
 
     // initialize context
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx                = 1;
-    ctx_params.n_batch              = 1;
+    ctx_params.n_ctx                = max_ctx_len;
+    ctx_params.n_batch              = max_batch_len;
     ctx_params.no_perf              = true;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
@@ -769,7 +1123,8 @@ int main(int argc, char ** argv) {
     dup2(_stderr_fd, STDERR_FILENO);
     close(_dev_null);
 
-    ggml_cgraph * gf = pipo_get_graph(ctx);
+    size_t        extra_buf_use = pipo_get_mem_usage(ctx);
+    ggml_cgraph * gf            = pipo_get_graph(ctx);
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_name("cpu", NULL);
     ggml_backend_t gpu_backend = NULL;
@@ -793,7 +1148,7 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
     size_t             _;
     ggml_backend_dev_memory(dev, &free_memory, &_);
-    free_memory = free_memory * 4 / 5;
+    free_memory = (free_memory - extra_buf_use) - (size_t) ((double) (free_memory - extra_buf_use) * 0.02);
 
     // 需要按照 graph node 顺序排序
     auto                       tensor_by_name = model->tensors_by_name;
@@ -817,10 +1172,13 @@ int main(int argc, char ** argv) {
         return tensor_by_name_node_idx[a.second] < tensor_by_name_node_idx[b.second];
     });
     auto [override_list, offload_list] =
+    #if 0
         use_dp ? dp_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                              h2d_bandwidth, alpha, beta, theta) :
                  greedy_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                                  h2d_bandwidth, alpha, beta, theta);
+    #endif
+    lagrangian_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory, h2d_bandwidth);
     llama_free(ctx);
     llama_model_free(model);
 
