@@ -687,6 +687,293 @@ static pair<vector<string>, vector<string>> greedy_strategy(
     return { std::move(override_list), std::move(offload_list) };
 }
 
+// 帕累托状态定义
+struct ParetoState {
+    double time_cost;          // 从当前层到结束的累计计算时间 (不含当前层之前的等待)
+    size_t mem_usage;          // 从当前层到结束占用的显存
+    double required_overlap;   // 需要前一层 (i-1) 提供多少计算时间来掩盖当前层的 H2D 传输
+    int    decision;           // 0: CPU, 1: GPU, 2: Hybrid(GPU Mem + CPU Compute)
+    int    parent_idx;         // 回溯用：上一层帕累托列表中的索引
+    bool   prev_was_gpu;       // 回溯用：上一层是否在 GPU 计算 (用于计算切换惩罚)
+    size_t offload_buffer_size; // offload buffer 的大小取决于 offload 的最大的 tensor 的大小
+};
+
+// 分桶剪枝
+std::vector<ParetoState> prune_pareto_bucketed(
+    std::vector<ParetoState>& states, 
+    size_t max_states = 10000,
+    size_t mem_bucket_count = 1000,
+    size_t overlap_bucket_count = 1000) {
+    
+    if (states.empty()) return states;
+    
+    // 1. 计算内存和 overlap 的范围
+    size_t min_mem = SIZE_MAX, max_mem = 0;
+    double min_overlap = INFINITY, max_overlap = 0;
+    for (const auto& s : states) {
+        min_mem = std::min(min_mem, s.mem_usage);
+        max_mem = std::max(max_mem, s.mem_usage);
+        min_overlap = std::min(min_overlap, s.required_overlap);
+        max_overlap = std::max(max_overlap, s.required_overlap);
+    }
+    
+    // 2. 创建分桶网格 [mem_bucket][overlap_bucket] -> 该桶内时间最优的状态索引
+    std::vector<std::vector<int>> buckets(
+        mem_bucket_count, 
+        std::vector<int>(overlap_bucket_count, -1));
+    
+    auto get_mem_bucket = [&](size_t mem) -> int {
+        if (max_mem == min_mem) return 0;
+        int bucket = (int)((mem - min_mem) * mem_bucket_count / (max_mem - min_mem + 1));
+        return std::min(bucket, (int)mem_bucket_count - 1);
+    };
+    
+    auto get_overlap_bucket = [&](double overlap) -> int {
+        if (max_overlap == min_overlap) return 0;
+        int bucket = (int)((overlap - min_overlap) * overlap_bucket_count / (max_overlap - min_overlap + 1e-6));
+        return std::min(bucket, (int)overlap_bucket_count - 1);
+    };
+    
+    // 3. 将状态分配到桶中，每个桶只保留时间最优的
+    for (int i = 0; i < (int)states.size(); i++) {
+        int mb = get_mem_bucket(states[i].mem_usage);
+        int ob = get_overlap_bucket(states[i].required_overlap);
+        
+        if (buckets[mb][ob] == -1 || states[i].time_cost < states[buckets[mb][ob]].time_cost) {
+            buckets[mb][ob] = i;
+        }
+    }
+    
+    // 4. 收集所有桶的代表状态
+    std::vector<ParetoState> result;
+    result.reserve(mem_bucket_count * overlap_bucket_count);
+    for (int mb = 0; mb < (int)mem_bucket_count; mb++) {
+        for (int ob = 0; ob < (int)overlap_bucket_count; ob++) {
+            if (buckets[mb][ob] != -1) {
+                result.push_back(states[buckets[mb][ob]]);
+            }
+        }
+    }
+    
+    // 5. 如果仍然超过上限，按时间排序截取 top K
+    if (result.size() > max_states) {
+        std::sort(result.begin(), result.end(), [](const ParetoState& a, const ParetoState& b) {
+            return a.time_cost < b.time_cost;
+        });
+        result.resize(max_states);
+    }
+    
+    return result;
+}
+
+static pair<vector<string>, vector<string>> dp_strategy_pareto(
+    ggml_cgraph *                                                gf,
+    const vector<pair<string, ggml_tensor *>> &                  tensors_by_name,
+    const unordered_map<string, unordered_map<string, double>> & op_perf_results,
+    const char *                                                 _cpu_backend_name,
+    const char *                                                 _gpu_backend_name,
+    size_t                                                       free_mem,
+    double                                                       h2d_bandwidth,
+    const double                                                 alpha = 1.0,
+    const double                                                 beta  = 1.0,
+    const double                                                 theta = 0.5) {
+    
+    const string cpu_name(_cpu_backend_name);
+    const string gpu_name(_gpu_backend_name);
+    using n_id = int;
+    using w_id = int;
+    unordered_map<n_id, w_id> n2w;
+    unordered_map<w_id, n_id> w2n;
+    {
+        unordered_map<string, w_id> w2i;
+        for (w_id i = 0; i < (int) tensors_by_name.size(); i++) {
+            w2i[tensors_by_name[i].first] = i;
+        }
+        for (n_id node_id = 0; node_id < ggml_graph_n_nodes(gf); node_id += 1) {
+            ggml_tensor * t = ggml_graph_node(gf, node_id);
+            for (n_id src_id = 0; src_id < GGML_MAX_SRC; src_id++) {
+                if (t->src[src_id] == nullptr) break;
+                if (!w2i.count(string(t->src[src_id]->name))) continue;
+                w_id weight_id = w2i[string(t->src[src_id]->name)];
+                n2w[node_id]   = weight_id;
+                w2n[weight_id] = node_id;
+            }
+        }
+    }
+
+    auto gpu_compute_time = [&](n_id node_id) -> double {
+        const ggml_tensor * t = ggml_graph_node(gf, node_id);
+        if (pipo_is_view_op(t->op)) return 0;
+        if (!op_perf_results.count(gpu_name) || !op_perf_results.at(gpu_name).count(pipo_make_op_key(t)) ||
+            op_perf_results.at(gpu_name).at(pipo_make_op_key(t)) == -1) return INFINITY;
+        return op_perf_results.at(gpu_name).at(pipo_make_op_key(t));
+    };
+    auto cpu_compute_time = [&](n_id node_id) -> double {
+        const ggml_tensor * t = ggml_graph_node(gf, node_id);
+        if (pipo_is_view_op(t->op)) return 0;
+        if (!op_perf_results.count(cpu_name) || !op_perf_results.at(cpu_name).count(pipo_make_op_key(t)) ||
+            op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) == -1) return INFINITY;
+        return op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) * alpha;
+    };
+    auto weight_size = [&](w_id weight_id) -> size_t {
+        return ggml_nbytes(tensors_by_name[weight_id].second);
+    };
+
+    const w_id weight_cnt = tensors_by_name.size();
+    vector<double> mid_node_sum_C(weight_cnt, 0.0);
+    vector<double> mid_node_sum_G(weight_cnt, 0.0);
+    for (w_id i = 0; i < weight_cnt; i++) {
+        n_id l = w2n[i] + 1;
+        n_id r = i == weight_cnt - 1 ? ggml_graph_n_nodes(gf) : w2n[i + 1];
+        for (n_id j = l; j < r; j++) {
+            mid_node_sum_C[i] += cpu_compute_time(j);
+            mid_node_sum_G[i] += gpu_compute_time(j);
+        }
+    }
+
+    vector<double> cpu_compute_time_cache(weight_cnt);
+    vector<double> gpu_compute_time_cache(weight_cnt);
+    vector<double> weight_transfer_time(weight_cnt);
+    for (w_id i = 0; i < weight_cnt; i++) {
+        cpu_compute_time_cache[i] = cpu_compute_time(w2n[i]);
+        gpu_compute_time_cache[i] = gpu_compute_time(w2n[i]);
+        weight_transfer_time[i]   = (double) weight_size(i) / h2d_bandwidth * beta;
+    }
+
+    // DP 状态池：pareto_states[i] 存储第 i 层之后的所有帕累托最优状态
+    vector<vector<ParetoState>> pareto_states(weight_cnt + 1);
+    // 初始化最后一层之后 (End State)
+    pareto_states[weight_cnt].push_back({0.0, 0, 0.0, -1, -1, false, 0});
+
+    fprintf(stderr, "[INFO] Starting Pareto DP Search...\n");
+    auto begin = ggml_time_ms();
+
+    for (w_id wid = weight_cnt - 1; wid >= 0; wid--) {
+        vector<ParetoState> current_candidates;
+        // 预留空间，减少 realloc
+        current_candidates.reserve(pareto_states[wid + 1].size() * 3); 
+
+        double t_cC = cpu_compute_time_cache[wid];
+        double t_cG = gpu_compute_time_cache[wid];
+        double t_midC = mid_node_sum_C[wid];
+        double t_midG = mid_node_sum_G[wid];
+        double t_h2d = weight_transfer_time[wid];
+        size_t w_mem = weight_size(wid);
+
+        // 遍历上一层 (wid+1) 的所有帕累托状态
+        for (int prev_idx = 0; prev_idx < (int)pareto_states[wid + 1].size(); prev_idx++) {
+            const auto& prev = pareto_states[wid + 1][prev_idx];
+
+            // --- 决策 1: 当前层在 CPU 计算 (不占显存，无需传输) ---
+            {
+                size_t new_mem = prev.mem_usage;
+                if (new_mem <= free_mem) {
+                    double new_time = (t_cC + t_midC) + prev.time_cost;
+                    if (prev.prev_was_gpu){
+                        new_time = (t_cC + t_midG) + prev.time_cost;
+                    } 
+                    double remaining_overlap_needed = std::max(0.0, prev.required_overlap - (new_time - prev.time_cost));
+                    
+                    current_candidates.push_back({
+                        new_time, new_mem, remaining_overlap_needed, 
+                        0, prev_idx, false, prev.offload_buffer_size // decision=0 (CPU), prev_was_gpu=false (for next iter)
+                    });
+                }
+            }
+
+            // --- 决策 2: 当前层在 GPU 计算 (占显存，不需传输) ---
+            {
+                size_t new_mem = prev.mem_usage + w_mem;
+                if (new_mem <= free_mem) {
+                    double new_time = (t_cG + t_midG) + prev.time_cost;
+                    if (!prev.prev_was_gpu) new_time += theta; // CPU -> GPU 切换
+                    double remaining_overlap_needed = std::max(0.0, prev.required_overlap - (new_time - prev.time_cost));
+
+                    current_candidates.push_back({
+                        new_time, new_mem, remaining_overlap_needed, 
+                        1, prev_idx, true, prev.offload_buffer_size // decision=1 (GPU)
+                    });
+                }
+            }
+
+            // --- 决策 3: 当前层本身在主存上，运行时异步传输到在 GPU 计算 (几乎不占显存，需传输) ---
+            {
+                size_t new_mem = prev.mem_usage;
+                size_t offload_buf_size = prev.offload_buffer_size;
+                if (w_mem > prev.offload_buffer_size) {
+                    new_mem += (w_mem - prev.offload_buffer_size);
+                    offload_buf_size = w_mem;
+                }
+                if (new_mem <= free_mem) {
+                    double bubble = std::max(0.0, prev.required_overlap - (t_cC + t_midC));
+                    double new_required_overlap = t_h2d;
+
+                    double new_time = t_cG + prev.time_cost + (prev.prev_was_gpu ? t_midG : theta + t_midC) + bubble;
+
+                    current_candidates.push_back({
+                        new_time, new_mem, new_required_overlap, 
+                        2, prev_idx, false, offload_buf_size // decision=2 (Hybrid)
+                    });
+                }
+            }
+        }
+
+        // 帕累托剪枝
+        pareto_states[wid] = prune_pareto_bucketed(current_candidates);
+        
+        // 进度打印
+        if ((weight_cnt - wid) % (weight_cnt / 20 + 1) == 0) {
+            fprintf(stderr, "\r[INFO] Pareto DP Progress: %d/%d layers (States: %zu)", 
+                    weight_cnt - wid, weight_cnt, pareto_states[wid].size());
+            fflush(stderr);
+        }
+    }
+    fprintf(stderr, "\n");
+
+    // --- 结果选择与回溯 ---
+    // 在第一层 (wid=0)，required_overlap 变成了初始 H2D 等待时间 (因为没有 wid=-1 来掩盖)
+    double min_total_time = INFINITY;
+    int best_idx = -1;
+
+    for (int i = 0; i < (int)pareto_states[0].size(); i++) {
+        const auto& s = pareto_states[0][i];
+        // 总时间 = 初始传输等待 + 累计计算时间
+        double total = s.required_overlap + s.time_cost;
+        if (total < min_total_time) {
+            min_total_time = total;
+            best_idx = i;
+        }
+    }
+
+    if (best_idx == -1) {
+        fprintf(stderr, "[ERROR] No valid strategy found (Memory constraint too tight?)\n");
+        return { {}, {} };
+    }
+
+    fprintf(stderr, "[INFO] Pareto DP Estimated Time = %.4lf ms\n", min_total_time);
+
+    vector<string> override_list; 
+    vector<string> offload_list;  
+
+    int cur_idx = best_idx;
+    for (w_id wid = 0; wid < weight_cnt; wid++) {
+        const auto& s = pareto_states[wid][cur_idx];
+        const string& name = tensors_by_name[wid].first;
+
+        if (s.decision == 0) {
+            override_list.push_back(name);
+        } else if (s.decision == 1) {
+        } else if (s.decision == 2) {
+            override_list.push_back(name);
+            offload_list.push_back(name);
+        }
+
+        cur_idx = s.parent_idx;
+    }
+
+    return { override_list, offload_list };
+}
+
 
 static void print_usage(int _, char ** argv) {
     (void)_;
@@ -877,7 +1164,7 @@ int main(int argc, char ** argv) {
         return tensor_by_name_node_idx[a.second] < tensor_by_name_node_idx[b.second];
     });
     auto [override_list, offload_list] =
-        use_dp ? dp_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
+        use_dp ? dp_strategy_pareto(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                              h2d_bandwidth, alpha, beta, theta) :
                  greedy_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                                  h2d_bandwidth, alpha, beta, theta);
