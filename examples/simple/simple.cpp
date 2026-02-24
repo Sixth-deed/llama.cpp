@@ -4,7 +4,6 @@
 #include <string>
 #include <vector>
 #include <fstream>
-#include <nvtx3/nvtx3.hpp>
 #include "../vendor/nlohmann/json.hpp"
 
 static void print_usage(int, char ** argv) {
@@ -387,12 +386,10 @@ int main(int argc, char ** argv) {
 
     for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
         // evaluate the current batch with the transformer model
-        nvtxRangePushA("Decode Batch");
         if (llama_decode(ctx, batch)) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
             return 1;
         }
-        nvtxRangePop();
         n_pos += batch.n_tokens;
 
         // sample the next token

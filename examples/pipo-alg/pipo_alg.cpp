@@ -852,7 +852,8 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
     size_t             _;
     ggml_backend_dev_memory(dev, &free_memory, &_);
-    free_memory = (free_memory - extra_buf_use) - (size_t) ((double) (free_memory - extra_buf_use) * 0.02);
+    // reserve 250 MB overhead
+    free_memory = (free_memory - extra_buf_use) - (size_t) (250 * 1024 * 1024);
 
     // 需要按照 graph node 顺序排序
     auto                       tensor_by_name = model->tensors_by_name;

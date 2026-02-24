@@ -2106,6 +2106,12 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_outputs = save_n_outputs;
 
+    if (cparams.enable_pipo){
+        for (auto& [_, t] : model.weight_map){
+            ggml_backend_sched_set_tensor_backend(sched.get(), t, backend_ptrs[0]);
+        }
+    }
+
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {

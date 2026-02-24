@@ -1295,10 +1295,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             need_new_split = true;
                             break;
                         }
-                        if (sched->enable_pipo && is_dynamic_tensor(src)) {
+                    }
+                    if (sched->enable_pipo && is_dynamic_tensor(src)) {
                             need_new_split = true;
                             break;
-                        }
                     }
                     // check if the split has too many inputs
                     // FIXME: count the number of inputs instead of only checking when full

@@ -11,7 +11,6 @@ using namespace std;
 #include <ggml-backend.h>
 #include <ggml.h>
 
-#include <nvtx3/nvtx3.hpp>
 
 /*
     TODO: reserve cuda mem base on graph alloc and kv cache alloc instead of guessing
@@ -300,7 +299,6 @@ struct SingleTestResult {
 };
 
 static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend, int n_iter) {
-    nvtx3::scoped_range r{ ggml_backend_name(backend) };
     ggml_init_params    init_params = {
         /* .mem_size = */ ggml_tensor_overhead() * 128 + ggml_graph_overhead_custom(8192, false),
         /* .mem_base = */ NULL,
