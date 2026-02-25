@@ -695,11 +695,11 @@ struct ParetoState {
     int    decision;           // 0: CPU, 1: GPU, 2: Hybrid(GPU Mem + CPU Compute)
     int    parent_idx;         // 回溯用：上一层帕累托列表中的索引
     bool   prev_was_gpu;       // 回溯用：上一层是否在 GPU 计算 (用于计算切换惩罚)
-    size_t offload_buffer_size; // offload buffer 的大小取决于 offload 的最大的 tensor 的大小
+    size_t offload_buffer_size; // offload buffer 的大小取决于 offload 的最大的 tensor 的大小(现在的实现暂时不是)
 };
 
 // 分桶剪枝
-std::vector<ParetoState> prune_pareto_bucketed(
+static std::vector<ParetoState> prune_pareto_bucketed(
     std::vector<ParetoState>& states, 
     size_t max_states = 10000,
     size_t mem_bucket_count = 1000,
@@ -846,7 +846,6 @@ static pair<vector<string>, vector<string>> dp_strategy_pareto(
     pareto_states[weight_cnt].push_back({0.0, 0, 0.0, -1, -1, false, 0});
 
     fprintf(stderr, "[INFO] Starting Pareto DP Search...\n");
-    auto begin = ggml_time_ms();
 
     for (w_id wid = weight_cnt - 1; wid >= 0; wid--) {
         vector<ParetoState> current_candidates;
@@ -930,8 +929,6 @@ static pair<vector<string>, vector<string>> dp_strategy_pareto(
     }
     fprintf(stderr, "\n");
 
-    // --- 结果选择与回溯 ---
-    // 在第一层 (wid=0)，required_overlap 变成了初始 H2D 等待时间 (因为没有 wid=-1 来掩盖)
     double min_total_time = INFINITY;
     int best_idx = -1;
 
@@ -1164,7 +1161,7 @@ int main(int argc, char ** argv) {
         return tensor_by_name_node_idx[a.second] < tensor_by_name_node_idx[b.second];
     });
     auto [override_list, offload_list] =
-        use_dp ? dp_strategy_pareto(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
+        use_dp ? dp_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                              h2d_bandwidth, alpha, beta, theta) :
                  greedy_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                                  h2d_bandwidth, alpha, beta, theta);
