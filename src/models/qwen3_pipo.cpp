@@ -57,18 +57,19 @@ llm_build_qwen3_pipo::llm_build_qwen3_pipo(const llama_model & model, const llm_
         GGML_ASSERT(params.gtype == LLM_GRAPH_TYPE_DEFAULT_DECODE);
         init_regex(regex, model.d_offload_weights);
     }
-    auto get_offloaded = [&](ggml_tensor * t) {
-        if (t && need_offload(regex, std::string(t->name))) {
-            struct ggml_tensor * dynamic_tensor =  model.name_weight_map.at(std::string(t->name));
-            res->dynamic_src_tensor_list[dynamic_tensor->name].push_back(t);
-            res->dynamic_dst_tensor_list[dynamic_tensor->name].push_back(dynamic_tensor);
-            return dynamic_tensor;
-        }
-        return t;
-    };
 
     for (int il = 0; il < n_layer; ++il) {
-        
+
+        auto get_offloaded = [&](ggml_tensor * t) {
+            if (t && need_offload(regex, std::string(t->name))) {
+                struct ggml_tensor * dynamic_tensor = ggml_backend_sched_get_pipo_tensor(params.sched, model.name_weight_map.at(std::string(t->name)));
+                res->dynamic_src_tensor_list[dynamic_tensor->name].push_back(t);
+                res->dynamic_dst_tensor_list[dynamic_tensor->name].push_back(dynamic_tensor);
+                return dynamic_tensor;
+            }
+            return t;
+        };
+
         const llama_layer& layer = model.layers[il];
         attn_norm   = get_offloaded(layer.attn_norm);
         wq          = get_offloaded(layer.wq);

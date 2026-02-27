@@ -2897,8 +2897,8 @@ bool llama_model::load_tensors_pipo(llama_model_loader & ml) {
     }
 
     {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dynamic, buft_dynamic);
-        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        // ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dynamic, buft_dynamic);
+        // ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         // llama_buf_map buf_map_dl;
         // buf_map_dl.emplace(0, buf);
         // for (auto & buf : buf_map_dl) {

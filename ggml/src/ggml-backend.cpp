@@ -748,6 +748,9 @@ struct ggml_backend_sched {
     int n_graph_inputs;
 
     struct ggml_context * ctx;
+    struct ggml_context * pipo_ctx;
+    ggml_backend_buffer_t pipo_buf;
+    std::unordered_map<ggml_tensor*, ggml_tensor*> pipo_tensor_map;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1299,6 +1302,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             break;
                         }
                     }
+                    
                     // check if the split has too many inputs
                     // FIXME: count the number of inputs instead of only checking when full
                     if (split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS) {
@@ -2136,7 +2140,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     // pipo params
     sched->enable_pipo = enable_pipo;
-
+    if (sched->enable_pipo){
+        ggml_init_params pipo_ctx_param = {
+            100 * ggml_tensor_overhead(),
+            malloc(100 * ggml_tensor_overhead()),
+            true
+        };
+        sched->pipo_ctx = ggml_init(pipo_ctx_param);
+        new (&sched->pipo_tensor_map) std::unordered_map<ggml_tensor*, ggml_tensor*>();
+    }
     ggml_backend_sched_reset(sched);
 
     return sched;
@@ -2153,6 +2165,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
+    if (sched->enable_pipo){
+        ggml_backend_buffer_free(sched->pipo_buf);
+        sched->pipo_buf = nullptr;
+        ggml_free(sched->pipo_ctx);
+    }
     ggml_hash_set_free(&sched->hash_set);
     free(sched->splits);
     free(sched->hv_tensor_backend_ids);
@@ -2167,7 +2184,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
     sched->dynamic_tensor_list.~unordered_map();
     sched->dynamic_tensor_cpy_events.~unordered_map();
-
+    sched->pipo_tensor_map.~unordered_map();
     free(sched);
 }
 
@@ -2182,6 +2199,25 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     }
     sched->is_alloc = false;
     sched->dynamic_tensor_list.clear();
+    if (sched->enable_pipo){
+        ggml_backend_buffer_free(sched->pipo_buf);
+        sched->pipo_buf = nullptr;
+        ggml_free(sched->pipo_ctx);
+        ggml_init_params pipo_ctx_param = {
+            100 * ggml_tensor_overhead(),
+            malloc(100 * ggml_tensor_overhead()),
+            true
+        };
+        sched->pipo_ctx = ggml_init(pipo_ctx_param);   
+    }
+    sched->pipo_tensor_map.clear();
+}
+
+static void pipo_alloc_dynamic_tensors(ggml_backend_sched_t sched){
+    sched->pipo_buf = ggml_backend_alloc_ctx_tensors(sched->pipo_ctx, sched->backends[0]);
+    ggml_backend_buffer_set_usage(sched->pipo_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    GGML_LOG_INFO("%s: %12s dynamic buffer size = %8.2f MiB\n",__func__,
+                 ggml_backend_buffer_name(sched->pipo_buf), ggml_backend_buffer_get_size(sched->pipo_buf) / 1024.0 / 1024.0);
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -2190,6 +2226,9 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     GGML_ASSERT(sizes);
 
     ggml_backend_sched_reset(sched);
+    if (sched->enable_pipo){
+        pipo_alloc_dynamic_tensors(sched);
+    }
 
     ggml_backend_sched_synchronize(sched);
 
@@ -2201,6 +2240,11 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+
+    
+    if (sched->enable_pipo){
+        pipo_alloc_dynamic_tensors(sched);
+    }
 
     ggml_backend_sched_synchronize(sched);
 
@@ -2222,6 +2266,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+
+    if (sched->enable_pipo){
+        pipo_alloc_dynamic_tensors(sched);
+    }
 
     ggml_backend_sched_split_graph(sched, graph);
 
@@ -2279,7 +2327,15 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
 }
-
+struct ggml_tensor* ggml_backend_sched_get_pipo_tensor(ggml_backend_sched_t sched, struct ggml_tensor* origin_tensor){
+    GGML_ASSERT(sched);
+    if (!sched->pipo_tensor_map.count(origin_tensor)){
+        sched->pipo_tensor_map[origin_tensor] = ggml_dup_tensor(sched->pipo_ctx, origin_tensor);
+        ggml_set_name(sched->pipo_tensor_map[origin_tensor], origin_tensor->name);
+        fprintf(stderr, "%s: pipo assign new dynamic weight %s\n", __func__, origin_tensor->name);
+    }
+    return sched->pipo_tensor_map.at(origin_tensor);
+}
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;

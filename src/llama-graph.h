@@ -654,6 +654,7 @@ public:
 
     std::unordered_map<std::string, std::vector<struct ggml_tensor *>> dynamic_src_tensor_list;
     std::unordered_map<std::string, std::vector<struct ggml_tensor *>> dynamic_dst_tensor_list;
+    std::vector<ggml_tensor**> dynamic_need_alloc;
 
 private:
     // keep a copy of the previous graph parameters
