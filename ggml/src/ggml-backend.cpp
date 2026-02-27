@@ -26,6 +26,7 @@
 #include <unordered_map>
 #include <string>
 
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -1700,18 +1701,18 @@ static enum ggml_status ggml_backend_sched_compute_splits_sync_pipo(ggml_backend
 
         copy_dynamic_tensor_next_synchronize(sched, split, dynamic_tensor_cpy_events);
 
-        t_start = ggml_time_us();
+        // t_start = ggml_time_us();
         {
             ret = copy_split_input(sched, split);
             if(ret != GGML_STATUS_SUCCESS){
                 return ret;
             }
         }
-        t_end = ggml_time_us();
-        duration_ms = (t_end - t_start) / 1000.0;
-        printf("\n\t%d split copy input tensors: %.3f ms\n", split_id, duration_ms);
+        // t_end = ggml_time_us();
+        // duration_ms = (t_end - t_start) / 1000.0;
+        // printf("\n\t%d split copy input tensors: %.3f ms\n", split_id, duration_ms);
         
-        t_start = ggml_time_us();
+        // t_start = ggml_time_us();
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1751,9 +1752,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_sync_pipo(ggml_backend
             }
         }
         ggml_backend_synchronize(split_backend);
-        t_end = ggml_time_us();
-        duration_ms = (t_end - t_start) / 1000.0;
-        printf("\n\t%d split compute: %.3f ms\n", split_id, duration_ms);
+        // t_end = ggml_time_us();
+        // duration_ms = (t_ed - t_start) / 1000.0;
+        // printf("\n\t%d split compute: %.3f ms\n", split_id, duration_ms);
 
         copy_dynamic_tensor_next(sched, split, dynamic_tensor_ids, dynamic_tensor_list, dynamic_tensor_cpy_events);
 
@@ -1789,6 +1790,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_async_pipo(ggml_backen
         ggml_backend_record_async_set(sched->backends[0], dynamic_tensor_cpy_events[name],
                                 list[0].second, list[0].first->data, 0, ggml_nbytes(list[0].first));
     }
+    
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1848,7 +1850,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_async_pipo(ggml_backen
             }
         }
         // ggml_backend_synchronize(split_backend);
-        // t_end = ggml_time_us();
+        // t_end = ggml_ime_us();
         // duration_ms = (t_end - t_start) / 1000.0;
         // printf("\n\t%d split compute: %.3f ms\n", split_id, duration_ms);
 

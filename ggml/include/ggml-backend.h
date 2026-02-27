@@ -340,6 +340,7 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    GGML_API struct ggml_tensor* ggml_backend_sched_get_pipo_tensor(ggml_backend_sched_t sched, struct ggml_tensor* origin_tensor);
     //
     // Utils
     //

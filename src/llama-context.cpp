@@ -1171,7 +1171,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
-        // pipo_op_recorder(gf);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2122,117 +2121,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     return gf;
 }
-pipo_graph_info * llama_context::get_graph_info(std::unordered_set<std::string>* override_tensors_ptr = nullptr)
-{
-    uint32_t n_tokens = 1;
-    uint32_t n_seqs = 1;
-    uint32_t n_outputs = 1;
-    auto mctx = memory->init_full(); 
-        
-    LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
 
-    ggml_backend_sched_reset(sched.get());
-
-    // when the scheduler is reset, we cannnot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
-
-    // store the n_outputs as it is, and restore it afterwards
-    // TODO: not sure if needed, might simplify in the future by removing this
-    const auto save_n_outputs = this->n_outputs;
-
-    this->n_outputs = n_outputs;
-
-    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
-    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
-
-    // set one output token per sequence in order to activate all backend samplers
-    std::vector<llama_seq_id> seq_ids(n_seqs);
-    for (uint32_t i = 0; i < n_seqs; ++i) {
-        seq_ids[i] = i;
-        ubatch.n_seq_id[i] = 1;
-        ubatch.seq_id[i] = &seq_ids[i];
-        ubatch.output[i] = true;
-    }
-
-    auto * res = gf_res_reserve.get();
-
-    auto gtype = cparams.enable_pipo?(n_tokens > 1? LLM_GRAPH_TYPE_DEFAULT_PREFILL:LLM_GRAPH_TYPE_DEFAULT_DECODE)
-                                    :LLM_GRAPH_TYPE_DEFAULT;
-
-    const auto gparams = graph_params(res, ubatch, mctx.get(), gtype);
-
-    res->reset();
-
-    auto * gf = model.build_graph(gparams);
-
-    this->n_outputs = save_n_outputs;
-
-    pipo_graph_info* result = new pipo_graph_info();
-
-
-    if (override_tensors_ptr != nullptr){
-        auto& override_tensors = *override_tensors_ptr;
-        auto interval_tensors = std::vector<std::string>();
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            ggml_tensor * node = ggml_graph_node(gf, i);
-            if (!node) continue;
-            if (pipo_is_view_op(node->op)) continue;
-            ggml_tensor* override_src = nullptr;
-            for (ggml_tensor* src : node->src){
-                if (!src) break;
-                if (override_tensors.count(std::string(src->name))){
-                    override_src = src;
-                } 
-            }
-            if (!override_src){
-                interval_tensors.push_back(pipo_make_op_key(node));
-            }
-            else{
-                result->override_tensors_interval.push_back(std::make_tuple(std::string(override_src->name), pipo_make_op_key(node), std::move(interval_tensors)));
-            }
-        }  
-    }
-    else{
-        // tensor info
-        // input/output tensors in model are in continous field, access them as a array
-        auto it = &model.tok_embd;
-        for (; it <= &model.per_layer_proj_norm; ++it){
-            const ggml_tensor* t = *it;
-            if (t == nullptr) continue;
-            // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
-            result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
-        }
-        for (it = &model.dense_2_out_layers; it <= &model.dense_3_out_layers; it++){
-            const ggml_tensor* t = *it;
-            if (t == nullptr) continue;
-            // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
-            result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
-        }
-        for (const auto& layer: model.layers){
-            for (it = &layer.attn_norm; it <= &layer.ffn_act_eps; it++){
-                const ggml_tensor* t = *it;
-                if (t == nullptr) continue;
-                // fprintf(stderr, "%s: %lfMB\n", t->name, (double)ggml_nbytes(t) / 1024 / 1024);
-                result->weight_sizes[std::string(t->name)] = ggml_nbytes(t);
-            }
-        }
-        // op info
-        auto& seen_ops = result->unique_ops;
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            ggml_tensor * node = ggml_graph_node(gf, i);
-            if (!node) continue;
-
-            if (pipo_is_view_op(node->op)) continue;
-            pipo_unique_op op(node);
-            if (!seen_ops.insert(op).second) continue;
-            // const std::string key = op.op_key();
-            // fprintf(stdout, "\nop_key[%zu]: ", key.size());
-            // fwrite(key.data(), 1, key.size(), stdout);
-        } 
-    }
-    return result;
-}
 
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
