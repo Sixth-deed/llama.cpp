@@ -8,7 +8,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-pipo pipo_alg_config] [prompt]\n", argv[0]);
+    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-pipo pipo_alg_config] [-p n_prompt] [-r random] [prompt]\n", argv[0]);
     printf("\n");
 }
 
@@ -177,6 +177,8 @@ int main(int argc, char ** argv) {
     int ngl = 99;
     // number of tokens to predict
     int n_predict = 32;
+    int n_prompt_target = -1; // -1 means use prompt length, otherwise fill to this length
+    bool enable_random = false;
     bool enable_pipo = false;
     // path to pipo perf file
     std::string pipo_alg_result_path;
@@ -224,6 +226,20 @@ int main(int argc, char ** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (strcmp(argv[i], "-p") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        n_prompt_target = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-r") == 0) {
+                enable_random = true;
             } else {
                 // prompt starts here
                 break;
@@ -300,16 +316,48 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     // tokenize the prompt
+    std::vector<llama_token> prompt_tokens;
 
-    // find the number of tokens in the prompt
-    const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
+    if (enable_random && n_prompt_target > 0) {
+        printf("Generating %d random tokens for prompt\n", n_prompt_target);
+        prompt_tokens.resize(n_prompt_target);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        int start_idx = 0;
+        if (llama_vocab_get_add_bos(vocab)) {
+            prompt_tokens[0] = llama_vocab_bos(vocab);
+            start_idx = 1;
+        }
+        for (int i = start_idx; i < n_prompt_target; i++) {
+            prompt_tokens[i] = std::rand() % n_vocab;
+        }
+    } else {
+        if (n_prompt_target > 0) {
+            // repeat prompt until we roughly hit the target length
+             printf("Repeating base prompt to roughly hit %d tokens\n", n_prompt_target);
+             std::string base_prompt = prompt;
+             int current_len = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
+             while (current_len < n_prompt_target) {
+                 prompt += " " + base_prompt;
+                 current_len = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
+             }
+        }
+        
+        // find the number of tokens in the prompt
+        const int n_prompt_actual = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
+        
+        // limit to target length if specified
+        int final_n_prompt = (n_prompt_target > 0 && n_prompt_target < n_prompt_actual) ? n_prompt_target : n_prompt_actual;
 
-    // allocate space for the tokens and tokenize the prompt
-    std::vector<llama_token> prompt_tokens(n_prompt);
-    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
-        fprintf(stderr, "%s: error: failed to tokenize the prompt\n", __func__);
-        return 1;
+        // allocate space for the tokens and tokenize the prompt
+        prompt_tokens.resize(n_prompt_actual);
+        if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
+            fprintf(stderr, "%s: error: failed to tokenize the prompt\n", __func__);
+            return 1;
+        }
+        prompt_tokens.resize(final_n_prompt); // truncate if we generated too many
     }
+    
+    int n_prompt = prompt_tokens.size();
 
     // pre-assign op_offload
     std::vector<const char*> p_offload, d_offload;
@@ -366,15 +414,19 @@ int main(int argc, char ** argv) {
 
     // print the prompt token-by-token
 
-    for (auto id : prompt_tokens) {
-        char buf[128];
-        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
-        if (n < 0) {
-            fprintf(stderr, "%s: error: failed to convert token to piece\n", __func__);
-            return 1;
+    if (!enable_random) {
+        for (auto id : prompt_tokens) {
+            char buf[128];
+            int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+            if (n < 0) {
+                fprintf(stderr, "%s: error: failed to convert token to piece\n", __func__);
+                return 1;
+            }
+            std::string s(buf, n);
+            printf("%s", s.c_str());
         }
-        std::string s(buf, n);
-        printf("%s", s.c_str());
+    } else {
+        printf("[Random prompt initialized, omitted from output]\n");
     }
 
     // prepare a batch for the prompt
@@ -437,13 +489,18 @@ int main(int argc, char ** argv) {
             n_decode += 1;
         }
     }
-    printf("\n");
-    for(auto &s: tokens){
-        printf("%s", s.c_str());
+    
+    if (!enable_random) {
+        printf("\n");
+        for(auto &s: tokens){
+            printf("%s", s.c_str());
+            fflush(stdout);
+        }
+        printf("\n");
         fflush(stdout);
+    } else {
+        printf("[Decoding completed, output omitted in random mode]\n");
     }
-    printf("\n");
-    fflush(stdout);
 
     const auto t_main_end = ggml_time_us();
 

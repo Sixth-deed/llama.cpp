@@ -11,6 +11,8 @@ CONFIG_PATH="examples/pipo-alg/alg_config.json"
 MODE="pipo"
 N_GL="10"
 N_PREDICT="32"
+N_PROMPT=""
+RANDOM_PROMPT=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -35,6 +37,14 @@ while [[ $# -gt 0 ]]; do
             N_PREDICT="$2"
             shift 2
             ;;
+        -p)
+            N_PROMPT="$2"
+            shift 2
+            ;;
+        -r|--random)
+            RANDOM_PROMPT="-r"
+            shift
+            ;;
         -c)
             CONFIG_PATH="$2"
             shift 2
@@ -57,6 +67,12 @@ fi
 
 # Prepare Command Arguments
 CMD_ARGS="-m $MODEL_PATH -ngl $N_GL -n $N_PREDICT"
+if [[ -n "$N_PROMPT" ]]; then
+    CMD_ARGS="$CMD_ARGS -p $N_PROMPT"
+fi
+if [[ -n "$RANDOM_PROMPT" ]]; then
+    CMD_ARGS="$CMD_ARGS $RANDOM_PROMPT"
+fi
 if [[ "$MODE" == "pipo" ]]; then
     CMD_ARGS="$CMD_ARGS -pipo $CONFIG_PATH"
 fi
