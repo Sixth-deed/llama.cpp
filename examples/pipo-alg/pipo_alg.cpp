@@ -1137,7 +1137,7 @@ int main(int argc, char ** argv) {
     size_t             _;
     ggml_backend_dev_memory(dev, &free_memory, &_);
     // reserve 250 MB overhead
-    free_memory = (free_memory - extra_buf_use) - (size_t) (250 * 1024 * 1024);
+    free_memory = (free_memory - extra_buf_use) - (size_t) (500 * 1024 * 1024);
 
     // 需要按照 graph node 顺序排序
     auto                       tensor_by_name = model->tensors_by_name;

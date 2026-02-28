@@ -322,6 +322,7 @@ int main(int argc, char ** argv) {
         }
         // offload all
         for (auto& override: overrides_list){
+            if(override.find("blk") != override.npos)
             p_offload.push_back(override.c_str());
         }
         #endif
