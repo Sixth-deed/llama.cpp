@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <regex>
+#include <cstring>
 using namespace std;
 
 void pipo_unique_op::debug_print() {

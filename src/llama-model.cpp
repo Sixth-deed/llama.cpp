@@ -2899,8 +2899,6 @@ bool llama_model::load_tensors_pipo(llama_model_loader & ml) {
     {
         // ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dynamic, buft_dynamic);
         // ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        // LLAMA_LOG_INFO("[dynamic] %s: %12s model buffer size = %8.2f MiB\n",
-        //         __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
         // llama_buf_map buf_map_dl;
         // buf_map_dl.emplace(0, buf);
         // for (auto & buf : buf_map_dl) {
@@ -8224,7 +8222,12 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_QWEN3MOE:
             {
-                llm = std::make_unique<llm_build_qwen3moe>(*this, params);
+                if(this->params.enable_pipo){
+                    llm = std::make_unique<llm_build_qwen3moe_pipo>(*this, params);
+                }
+                else{
+                    llm = std::make_unique<llm_build_qwen3moe>(*this, params);
+                }
             } break;
         case LLM_ARCH_QWEN3VL:
             {

@@ -56,7 +56,7 @@ fi
 # Prepare Command Arguments
 CMD_ARGS="-m $MODEL_PATH"
 if [ $MODE == "alg" ]; then
-    CMD_ARGS="$MODEL_PATH -$ALG $ALG_EXTRA_ALG"
+    CMD_ARGS="$MODEL_PATH -$ALG $ALG_EXTRA_ARG"
 fi
 # Prepare Log Directory and File
 MODEL_FILENAME=$(basename "$MODEL_PATH")
