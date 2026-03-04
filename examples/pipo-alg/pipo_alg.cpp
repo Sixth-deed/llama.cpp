@@ -1053,7 +1053,6 @@ static pair<vector<string>, vector<string>> stable_stratagy(ggml_cgraph* gf,
         }
     };
     map<tensor_key, vector<ggml_tensor*>, std::greater<tensor_key>> tensor_map;
-    size_t total_size = 0;
     for(const auto& layer : model->layers){
         int t_id = 0;
         for (; t_id < &layer.ffn_act_eps - &layer.attn_norm ; t_id ++){
@@ -1063,9 +1062,12 @@ static pair<vector<string>, vector<string>> stable_stratagy(ggml_cgraph* gf,
             if (!tensor_map.count(k)){
                 tensor_map.insert(make_pair(k, vector<ggml_tensor*>()));
             }
-            total_size += ggml_nbytes(t);
             tensor_map[k].push_back(t);
         }
+    }
+    size_t total_size = 0;
+    for (auto& [name, t]: tensors_by_name){
+        total_size += ggml_nbytes(t);
     }
     // override
     size_t need_override = total_size - free_mem;
@@ -1079,11 +1081,11 @@ static pair<vector<string>, vector<string>> stable_stratagy(ggml_cgraph* gf,
     }
     bool _e = false;
     for (auto& [k, arr] : tensor_map){
-        for (auto t : arr){
+        for (ggml_tensor* t : arr){
             if (need_override <= k.size) _e = true;
             need_override -= k.size;
             override_list.push_back(string(t->name));
-            fprintf(stderr, "offload tensor %15s [%5.2lf MB]\n", t->name, (double)k.size/ 1024.0 / 1024.0);
+            fprintf(stderr, "override tensor %15s [%5.2lf MB]\n", t->name, (double)k.size/ 1024.0 / 1024.0);
             if (_e) break;
         }
         if (_e) break;
@@ -1344,7 +1346,7 @@ int main(int argc, char ** argv) {
     size_t             _;
     ggml_backend_dev_memory(dev, &free_memory, &_);
     fprintf(stderr, "Env free mem = %.2lf MB\n", (double) free_memory / 1024.0 / 1024.0);
-    // reserve 250 MB overhead
+
     free_memory = (free_memory - extra_buf_use) - (size_t) (512 * 1024 * 1024);
 
     fprintf(stderr, "Target mem usage = %.2lf MB\n", (double) free_memory / 1024.0 / 1024.0);
@@ -1370,7 +1372,7 @@ int main(int argc, char ** argv) {
     sort(tensor_by_name.begin(), tensor_by_name.end(), [&](const auto & a, const auto & b) {
         return tensor_by_name_node_idx[a.second] < tensor_by_name_node_idx[b.second];
     });
-    #if 1
+    #if 0
     auto [override_list, offload_list] =
         use_dp ? dp_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                              h2d_bandwidth, alpha, beta, theta) :
