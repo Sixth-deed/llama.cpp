@@ -144,6 +144,10 @@ static pair<vector<string>, vector<string>> dp_strategy(
     };
     // TODO: 也许可以通过对tensors分组来减少彻底搜索的计算量
 
+    // 用于手动过滤一些强行放在 gpu 上的 weight
+    auto gpu_weight_filter = [&](w_id i) -> bool{
+        return strstr(tensors_by_name[i].first.c_str(), "attn"); 
+    };
     // 单位是字节
     constexpr size_t mem_bin_size  = 1024 * 1024;
     // 单位是毫秒
@@ -152,6 +156,7 @@ static pair<vector<string>, vector<string>> dp_strategy(
         return size / mem_bin_size + ((size % mem_bin_size) > (mem_bin_size / 2));
     };
     auto time_bin = [](double time) -> int {
+        if (time == INFINITY) return 65535;
         return (int) std::round(time / time_bin_size);
     };
     const w_id weight_cnt = tensors_by_name.size();
@@ -183,6 +188,7 @@ static pair<vector<string>, vector<string>> dp_strategy(
     vector<double> gpu_compute_time_cache(weight_cnt);
     for (w_id i = 0; i < weight_cnt; i++) {
         cpu_compute_time_cache[i] = cpu_compute_time(w2n[i]);
+        if (gpu_weight_filter(i)) cpu_compute_time_cache[i] = INFINITY;
         gpu_compute_time_cache[i] = gpu_compute_time(w2n[i]);
     }
 
@@ -190,6 +196,7 @@ static pair<vector<string>, vector<string>> dp_strategy(
     size_t actual_mem_usage;
     // 稍微留一点余量，尽量不触发重跑
     free_mem -= 2 * mem_bin_size;
+    fprintf(stderr, "alg target mem usage = %.2lf MB\n", (double) free_mem / 1024.0 / 1024.0);
     int    iter     = 0;
     int    max_iter = 10;
     do {
@@ -279,20 +286,22 @@ static pair<vector<string>, vector<string>> dp_strategy(
             vector<double>   offload_time(mem_bin_cnt, INFINITY);
             BitArray         offload_next_on_g(mem_bin_cnt);
             vector<uint16_t> offload_next_ttf(mem_bin_cnt, 0);
-            // t_nft 这里表达的是下一个传输剩余的时间，没传完要罚时
-            for (int t_nft = 0; t_nft < ttf_bin_cnt; t_nft++) {
-                for (int mem = 0; mem < mem_bin_cnt; mem++) {
-                    double t_next_C      = dp_C[idx_2d(t_nft, mem)] + theta;
-                    double t_next_G      = dp_G[idx_2d(t_nft, mem)];
-                    bool   cur_next_on_G = t_next_C > t_next_G;
-                    double t_total       = t_cG + t_cmidG + t_nft * time_bin_size + min(t_next_C, t_next_G);
-                    if (t_total < offload_time[mem]) {
-                        offload_time[mem] = t_total;
-                        offload_next_on_g.set(mem, cur_next_on_G);
-                        offload_next_ttf[mem] = t_nft;
+            if (!gpu_weight_filter(wid)){
+                // t_nft 这里表达的是下一个传输剩余的时间，没传完要罚时
+                for (int t_nft = 0; t_nft < ttf_bin_cnt; t_nft++) {
+                    for (int mem = 0; mem < mem_bin_cnt; mem++) {
+                        double t_next_C      = dp_C[idx_2d(t_nft, mem)] + theta;
+                        double t_next_G      = dp_G[idx_2d(t_nft, mem)];
+                        bool   cur_next_on_G = t_next_C > t_next_G;
+                        double t_total       = t_cG + t_cmidG + t_nft * time_bin_size + min(t_next_C, t_next_G);
+                        if (t_total < offload_time[mem]) {
+                            offload_time[mem] = t_total;
+                            offload_next_on_g.set(mem, cur_next_on_G);
+                            offload_next_ttf[mem] = t_nft;
+                        }
                     }
                 }
-            }
+            }   
 
             int ct_G_bin = time_bin(t_cG + t_cmidG);
             // 特判 transfer time = 0
@@ -1334,8 +1343,11 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
     size_t             _;
     ggml_backend_dev_memory(dev, &free_memory, &_);
+    fprintf(stderr, "Env free mem = %.2lf MB\n", (double) free_memory / 1024.0 / 1024.0);
     // reserve 250 MB overhead
-    free_memory = (free_memory - extra_buf_use) - (size_t) (1536 * 1024 * 1024);
+    free_memory = (free_memory - extra_buf_use) - (size_t) (512 * 1024 * 1024);
+
+    fprintf(stderr, "Target mem usage = %.2lf MB\n", (double) free_memory / 1024.0 / 1024.0);
 
     // 需要按照 graph node 顺序排序
     auto                       tensor_by_name = model->tensors_by_name;
@@ -1358,7 +1370,7 @@ int main(int argc, char ** argv) {
     sort(tensor_by_name.begin(), tensor_by_name.end(), [&](const auto & a, const auto & b) {
         return tensor_by_name_node_idx[a.second] < tensor_by_name_node_idx[b.second];
     });
-    #if 0
+    #if 1
     auto [override_list, offload_list] =
         use_dp ? dp_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                              h2d_bandwidth, alpha, beta, theta) :
