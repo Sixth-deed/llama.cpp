@@ -6,7 +6,7 @@ cd "$(dirname "$0")/../../" || exit 1
 
 # Defaults
 BUILD_TYPE="release"
-MODEL_PATH="/home/hitori/code/impl_ai/model/Qwen3-14B-Q4_K_M.gguf"
+MODEL_PATH="/home/hitori/pipo/model/Qwen3-14B-Q4_K_M.gguf"
 CONFIG_PATH="examples/pipo-alg/alg_config.json"
 MODE="pipo"
 N_GL="10"

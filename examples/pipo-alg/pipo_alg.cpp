@@ -971,7 +971,205 @@ static pair<vector<string>, vector<string>> dp_strategy_pareto(
     return { override_list, offload_list };
 }
 
+static pair<vector<string>, vector<string>> stable_stratagy(ggml_cgraph* gf, 
+    const vector<pair<string, ggml_tensor *>> &                  tensors_by_name,
+    const unordered_map<string, unordered_map<string, double>> & op_perf_results,
+    const char *                                                 _cpu_backend_name,
+    const char *                                                 _gpu_backend_name,
+    size_t free_mem,
+    double h2d_bandwidth,
+    llama_model* model,
+    double alpha = 1.0,
+    double beta = 1.0
+){
+    const string cpu_name(_cpu_backend_name);
+    const string gpu_name(_gpu_backend_name);
+    // node_index
+    using n_id = int;
+    // weight_index
+    using w_id = int;
+    auto gpu_compute_time = [&](n_id node_id) -> double {
+        const ggml_tensor * t = ggml_graph_node(gf, node_id);
+        if (pipo_is_view_op(t->op)) {
+            return 0;
+        }
+        if (!op_perf_results.count(gpu_name) || !op_perf_results.at(gpu_name).count(pipo_make_op_key(t)) ||
+            op_perf_results.at(gpu_name).at(pipo_make_op_key(t)) == -1) {
+            return INFINITY;
+        }
+        return op_perf_results.at(gpu_name).at(pipo_make_op_key(t));
+    };
+    auto cpu_compute_time = [&](n_id node_id) -> double {
+        const ggml_tensor * t = ggml_graph_node(gf, node_id);
+        if (pipo_is_view_op(t->op)) {
+            return 0;
+        }
+        if (!op_perf_results.count(cpu_name) || !op_perf_results.at(cpu_name).count(pipo_make_op_key(t)) ||
+            op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) == -1) {
+            fprintf(stderr, "cpu not support op\n%s\n", pipo_make_op_key(t).c_str());
+            return INFINITY;
+        }
+        return op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) * alpha;
+    };
+    auto weight_size = [&](w_id weight_id) -> size_t {
+        return ggml_nbytes(tensors_by_name[weight_id].second);
+    };
+    unordered_map<n_id, w_id> n2w;
+    unordered_map<w_id, n_id> w2n;
+    {
+        unordered_map<string, w_id> w2i;
+        for (w_id i = 0; i < (int) tensors_by_name.size(); i++) {
+            w2i[tensors_by_name[i].first] = i;
+        }
+        for (n_id node_id = 0; node_id < ggml_graph_n_nodes(gf); node_id += 1) {
+            ggml_tensor * t = ggml_graph_node(gf, node_id);
+            for (n_id src_id = 0; src_id < GGML_MAX_SRC; src_id++) {
+                if (t->src[src_id] == nullptr) {
+                    break;
+                }
+                if (!w2i.count(string(t->src[src_id]->name))) {
+                    continue;
+                }
+                w_id weight_id = w2i[string(t->src[src_id]->name)];
+                n2w[node_id]   = weight_id;
+                w2n[weight_id] = node_id;
+            }
+        }
+    }
+    struct tensor_key{
+        int off;
+        size_t size;
+        bool operator>(const tensor_key& r) const{
+            return size > r.size || (size == r.size && off < r.off);
+        }
+    };
+    map<tensor_key, vector<ggml_tensor*>, std::greater<tensor_key>> tensor_map;
+    size_t total_size = 0;
+    for(const auto& layer : model->layers){
+        int t_id = 0;
+        for (; t_id < &layer.ffn_act_eps - &layer.attn_norm ; t_id ++){
+            ggml_tensor* t = *(&layer.attn_norm + t_id);
+            if (!t || pipo_is_view_op(t->op))continue;
+            tensor_key k = {t_id, ggml_nbytes(t)};
+            if (!tensor_map.count(k)){
+                tensor_map.insert(make_pair(k, vector<ggml_tensor*>()));
+            }
+            total_size += ggml_nbytes(t);
+            tensor_map[k].push_back(t);
+        }
+    }
+    // override
+    size_t need_override = total_size - free_mem;
+    vector<string> override_list;
+    // specially override embed
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++){
+        if (gpu_compute_time(i) < 0 || gpu_compute_time(i) == INFINITY){
+            override_list.push_back(string(tensors_by_name[n2w[i]].first));
+            need_override -= ggml_nbytes(tensors_by_name[n2w[i]].second);
+        }
+    }
+    bool _e = false;
+    for (auto& [k, arr] : tensor_map){
+        for (auto t : arr){
+            if (need_override <= k.size) _e = true;
+            need_override -= k.size;
+            override_list.push_back(string(t->name));
+            fprintf(stderr, "offload tensor %15s [%5.2lf MB]\n", t->name, (double)k.size/ 1024.0 / 1024.0);
+            if (_e) break;
+        }
+        if (_e) break;
+    }
 
+    
+    // offload
+    // use the dp method
+    vector<string> offload_list;
+    {
+        unordered_set<string> override_set(override_list.begin(), override_list.end());
+        w_id                  weight_cnt    = tensors_by_name.size();
+        auto                  transfer_time = [&](w_id weight_id) -> double {
+            return (double) weight_size(weight_id) / h2d_bandwidth * beta;
+        };
+        // 每一个带权重节点自身计算时间与它之前的带权重节点间的节点计算时间之和
+        vector<double> computation_internal(weight_cnt, 0);
+        n_id           prev        = 0;
+        bool           prev_on_gpu = false;
+        for (w_id i = 0; i < weight_cnt; i++) {
+            n_id cur        = w2n[i];
+            bool cur_on_gpu = override_set.count(tensors_by_name[i].first);
+            if (cur_on_gpu) {
+                computation_internal[i] += gpu_compute_time(cur);
+            } else {
+                computation_internal[i] += cpu_compute_time(cur);
+            }
+            for (n_id j = prev; j < cur; j++) {
+                if (cur_on_gpu || prev_on_gpu) {
+                    computation_internal[i] += gpu_compute_time(j);
+                } else {
+                    computation_internal[i] += cpu_compute_time(j);
+                }
+            }
+            prev        = cur;
+            prev_on_gpu = cur_on_gpu;
+        }
+
+        auto computation_between = [&](w_id l, w_id r) -> double {
+            double result = 0;
+            for (w_id i = l + 1; i < r; i++) {
+                result += computation_internal[i];
+            }
+            return result;
+        };
+        // offload tensor 带来的时间差，使总计算时间时间减少时为负。越小越好
+        vector<double> offload_gain(weight_cnt, INFINITY);
+        vector<w_id>   offload_prev(weight_cnt, -1);
+        offload_gain[0] = gpu_compute_time(w2n[0]) + transfer_time(0) - cpu_compute_time(w2n[0]);
+        w_id override_prev = 1;
+        for (w_id cur = 1; cur < weight_cnt; cur++) {
+            if (!override_set.count(tensors_by_name[cur].first)) {
+                continue;
+            }
+            offload_gain[cur] =
+                gpu_compute_time(w2n[cur]) - cpu_compute_time(w2n[cur]) +
+                max((alpha - 1) * transfer_time(cur), transfer_time(cur) - computation_between(-1, cur));
+            // 限制小于 override_prev 用于防止连续的offload导致的长 gpu split 阻塞并发传输
+            for (w_id prev = 0; prev < override_prev; prev++) {
+                if (!override_set.count(tensors_by_name[prev].first)) {
+                    continue;
+                }
+                double offload_cur_gain =
+                    offload_gain[prev] + gpu_compute_time(w2n[cur]) - cpu_compute_time(w2n[cur]) +
+                    max((alpha - 1) * transfer_time(cur), transfer_time(cur) - computation_between(prev, cur));
+#if 0
+                fprintf(stderr, "cur = %d, prev = %d, gain = %lf compare to %lf\n", cur, prev, offload_cur_gain, offload_gain[cur]);
+                if (strstr(tensors_by_name[cur].first.c_str(), "ffn_up") || strstr(tensors_by_name[cur].first.c_str(), "ffn_gate")){
+                    fprintf(stderr, "%s: pgain=%.4lf, gt=%.4lf, ct=%.4lf, tt=%.4lf, it=%.4lf\n", tensors_by_name[cur].first.c_str(), offload_gain[prev],  gpu_compute_time(w2n[cur]), cpu_compute_time(w2n[cur]), 
+                    transfer_time(cur), computation_between(prev, cur));
+                }
+#endif
+                if (offload_cur_gain < offload_gain[cur]) {
+                    offload_gain[cur] = offload_cur_gain;
+                    offload_prev[cur] = prev;
+                }
+            }
+            override_prev = cur;
+        }
+        double min_gain = INFINITY;
+        w_id   min_last = -1;
+        for (w_id i = 0; i < weight_cnt; i++) {
+            if (min_gain > offload_gain[i]) {
+                min_gain = offload_gain[i];
+                min_last = i;
+            }
+        }
+        while (min_last != -1) {
+            offload_list.push_back(tensors_by_name[min_last].first);
+            min_last = offload_prev[min_last];
+        }
+        fprintf(stderr, "offload estimate gain = %lf\n", min_gain);
+    }
+    return make_pair(override_list, offload_list);
+}
 static void print_usage(int _, char ** argv) {
     (void)_;
     cerr << "Usage: " << argv[0] << " <model_file> [options]\n\n";
@@ -1137,7 +1335,7 @@ int main(int argc, char ** argv) {
     size_t             _;
     ggml_backend_dev_memory(dev, &free_memory, &_);
     // reserve 250 MB overhead
-    free_memory = (free_memory - extra_buf_use) - (size_t) (500 * 1024 * 1024);
+    free_memory = (free_memory - extra_buf_use) - (size_t) (1536 * 1024 * 1024);
 
     // 需要按照 graph node 顺序排序
     auto                       tensor_by_name = model->tensors_by_name;
@@ -1160,11 +1358,15 @@ int main(int argc, char ** argv) {
     sort(tensor_by_name.begin(), tensor_by_name.end(), [&](const auto & a, const auto & b) {
         return tensor_by_name_node_idx[a.second] < tensor_by_name_node_idx[b.second];
     });
+    #if 0
     auto [override_list, offload_list] =
         use_dp ? dp_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                              h2d_bandwidth, alpha, beta, theta) :
                  greedy_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                                  h2d_bandwidth, alpha, beta, theta);
+    #else 
+    auto [override_list, offload_list] = stable_stratagy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory, h2d_bandwidth, model);
+    #endif
     llama_free(ctx);
     llama_model_free(model);
 
