@@ -446,7 +446,6 @@ int main(int argc, char ** argv) {
 
         batch = llama_batch_get_one(&decoder_start_token_id, 1);
     }
-
     // main loop
 
     const auto t_main_start = ggml_time_us();

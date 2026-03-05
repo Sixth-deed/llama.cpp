@@ -772,7 +772,7 @@ struct ggml_backend_sched {
     // int n_layers = 0;
     // int n_cpu_layers_per_split = 3;
     // int n_static_layers = 10;
-    
+    bool pipo_alloced; 
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1014,9 +1014,23 @@ bool is_dynamic_tensor(struct ggml_tensor * tensor){
     return strncmp(tensor->name, "dynamic_", 8) == 0;
 }
 
+static void pipo_alloc_dynamic_tensors(ggml_backend_sched_t sched){
+    sched->pipo_buf = ggml_backend_alloc_ctx_tensors(sched->pipo_ctx, sched->backends[0]);
+    struct ggml_tensor * first = ggml_get_first_tensor(sched->pipo_ctx);
+    for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(sched->pipo_ctx, t)) {
+        fprintf(stderr, "%s: pipo alloc dynamic weight %s[%p]\n", __func__, t->name, (void*)t);
+    }
+    ggml_backend_buffer_set_usage(sched->pipo_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    GGML_LOG_INFO("%s: %12s dynamic buffer size = %8.2f MiB\n",__func__,
+                 ggml_backend_buffer_name(sched->pipo_buf), ggml_backend_buffer_get_size(sched->pipo_buf) / 1024.0 / 1024.0);
+    sched->pipo_alloced = true;
+}
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (sched->enable_pipo && !sched->pipo_alloced){
+        pipo_alloc_dynamic_tensors(sched);
+    }
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1269,9 +1283,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
+
+        bool prev_has_dynamic_input = false;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
-
+            if (strcmp(node->name, "ffn_gate-23") == 0){
+                fprintf(stderr, "trap\n");
+            }
             if (ggml_is_view_op(node->op)) {
                 continue;
             }
@@ -1282,7 +1300,25 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
-            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+            if (sched->enable_pipo && prev_has_dynamic_input){
+                need_new_split = true;
+                prev_has_dynamic_input = false;
+            }
+            // check dynamic input
+            else if (node_backend_id == cur_backend_id){
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src == NULL) {
+                        continue;
+                    }
+                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && sched->enable_pipo && is_dynamic_tensor(src)) {
+                        need_new_split = true;
+                        prev_has_dynamic_input = true;
+                        break;
+                    }
+                }
+            }
+            if (!need_new_split && node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -1293,10 +1329,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                            need_new_split = true;
-                            break;
-                        }
-                        if (sched->enable_pipo && is_dynamic_tensor(src)) {
                             need_new_split = true;
                             break;
                         }
@@ -2147,6 +2179,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         };
         sched->pipo_ctx = ggml_init(pipo_ctx_param);
         new (&sched->pipo_tensor_map) std::unordered_map<ggml_tensor*, ggml_tensor*>();
+        sched->pipo_alloced = false;
     }
     ggml_backend_sched_reset(sched);
 
@@ -2203,21 +2236,18 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->pipo_buf = nullptr;
         ggml_free(sched->pipo_ctx);
         ggml_init_params pipo_ctx_param = {
+            // TODO: remove hardcode 100
             100 * ggml_tensor_overhead(),
             malloc(100 * ggml_tensor_overhead()),
             true
         };
-        sched->pipo_ctx = ggml_init(pipo_ctx_param);   
+        sched->pipo_ctx = ggml_init(pipo_ctx_param); 
+        sched->pipo_alloced = false;  
     }
     sched->pipo_tensor_map.clear();
 }
 
-static void pipo_alloc_dynamic_tensors(ggml_backend_sched_t sched){
-    sched->pipo_buf = ggml_backend_alloc_ctx_tensors(sched->pipo_ctx, sched->backends[0]);
-    ggml_backend_buffer_set_usage(sched->pipo_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    GGML_LOG_INFO("%s: %12s dynamic buffer size = %8.2f MiB\n",__func__,
-                 ggml_backend_buffer_name(sched->pipo_buf), ggml_backend_buffer_get_size(sched->pipo_buf) / 1024.0 / 1024.0);
-}
+
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
@@ -2331,7 +2361,7 @@ struct ggml_tensor* ggml_backend_sched_get_pipo_tensor(ggml_backend_sched_t sche
     if (!sched->pipo_tensor_map.count(origin_tensor)){
         sched->pipo_tensor_map[origin_tensor] = ggml_dup_tensor(sched->pipo_ctx, origin_tensor);
         ggml_set_name(sched->pipo_tensor_map[origin_tensor], origin_tensor->name);
-        fprintf(stderr, "%s: pipo assign new dynamic weight %s\n", __func__, origin_tensor->name);
+        fprintf(stderr, "%s: pipo assign new dynamic weight %s[%p], origin [%p]\n", __func__, origin_tensor->name, (void* )sched->pipo_tensor_map.at(origin_tensor), (void*) origin_tensor);
     }
     return sched->pipo_tensor_map.at(origin_tensor);
 }
