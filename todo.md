@@ -21,10 +21,21 @@
     b. split: based on pre-assign / force split on dynamic tensors
 6. decode
 
-- 直接从大到小排列 tensor 然后 override 特定的 tensor 效果并不好，因为没有充分利用offload。
-- 关于 kv cache. set rows 和 flash attntion 算子不涉及别的 weight，kv cache本身被硬编码到 cuda，这俩算子会被 llama.cpp 分配到 cuda 上，这与算法的预期是不符合的。算法预期两个权重都在cpu上的话，两个权重所在算子之间的所有算子都会是在 cpu 上。现在存在 wk\wq\wk 和 attn_output.weight 在 cpu 上，但中间的 flash attn 算子不在 cpu 上而是在 gpu 上计算的情况。
+- [-] 类似手动调整的算法尝试
+  - 直接从大到小排列 tensor 然后 override 特定的 tensor 效果并不好，因为没有充分利用offload。
+  - 要考虑的点诡异地多，还是先回到 dp
+
+- [-] 为什么 output weight 没有在 prefill 时被 offload。
+  - 问题发生在 qwen3_pipo 的实现中，那里只考虑了各层 weight 的 offload，output 直接就是放在cpi上。
+  - 优先考虑 offload 的话也不会再 override output tensor 了，其实无所谓。
+
+- [] 关于 kv cache. set rows 和 flash attntion 算子不涉及别的 weight，kv cache本身被硬编码到 cuda，这俩算子会被 llama.cpp 分配到 cuda 上，这与算法的预期是不符合的。算法预期两个权重都在cpu上的话，两个权重所在算子之间的所有算子都会是在 cpu 上。现在存在 wk\wq\wk 和 attn_output.weight 在 cpu 上，但中间的 flash attn 算子不在 cpu 上而是在 gpu 上计算的情况。
   - 一种修改方向是让算法加上这种情况，这样会比较臃肿，可能要引入更多的额外内存用于表达 dp 状态
   - 另一个方向是更改pipo框架，把 kv cache 也纳入相似的 override 体系中。
-- prefill 的瓶颈在于 mem 传输和计算没什么并发，dynamic tensor 的传输是 per split 的，而prefill 阶段一个 dynamic tensor 就会有一个 split。落实到 prefill 上就是 compute split-> mem cpy -> compute split -> mem cpy
+
+- [-] prefill 的瓶颈在于 mem 传输和计算没什么并发，dynamic tensor 的传输是 per split 的，而prefill 阶段一个 dynamic tensor 就会有一个 split。落实到 prefill 上就是 compute split-> mem cpy -> compute split -> mem cpy
   - 这个改好了应该能大幅提升 prefill 速度
+  - *已完成*，有一定提升，但不多，因为现在的算法都是集中于decode阶段的。引入的延时大约是 100 微秒 per dynamic tensor
+
+- [] 检查各个算子运算速度随着 batch 提升的情况，新的目标是关注 prefill 加速，现在的版本的 prefill 速度远远没有到极限。
 

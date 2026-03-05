@@ -1016,10 +1016,6 @@ bool is_dynamic_tensor(struct ggml_tensor * tensor){
 
 static void pipo_alloc_dynamic_tensors(ggml_backend_sched_t sched){
     sched->pipo_buf = ggml_backend_alloc_ctx_tensors(sched->pipo_ctx, sched->backends[0]);
-    struct ggml_tensor * first = ggml_get_first_tensor(sched->pipo_ctx);
-    for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(sched->pipo_ctx, t)) {
-        fprintf(stderr, "%s: pipo alloc dynamic weight %s[%p]\n", __func__, t->name, (void*)t);
-    }
     ggml_backend_buffer_set_usage(sched->pipo_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     GGML_LOG_INFO("%s: %12s dynamic buffer size = %8.2f MiB\n",__func__,
                  ggml_backend_buffer_name(sched->pipo_buf), ggml_backend_buffer_get_size(sched->pipo_buf) / 1024.0 / 1024.0);
@@ -2361,7 +2357,7 @@ struct ggml_tensor* ggml_backend_sched_get_pipo_tensor(ggml_backend_sched_t sche
     if (!sched->pipo_tensor_map.count(origin_tensor)){
         sched->pipo_tensor_map[origin_tensor] = ggml_dup_tensor(sched->pipo_ctx, origin_tensor);
         ggml_set_name(sched->pipo_tensor_map[origin_tensor], origin_tensor->name);
-        fprintf(stderr, "%s: pipo assign new dynamic weight %s[%p], origin [%p]\n", __func__, origin_tensor->name, (void* )sched->pipo_tensor_map.at(origin_tensor), (void*) origin_tensor);
+        fprintf(stderr, "%s: pipo assign new dynamic weight %s\n", __func__, origin_tensor->name);
     }
     return sched->pipo_tensor_map.at(origin_tensor);
 }
