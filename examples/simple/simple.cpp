@@ -172,7 +172,16 @@ int main(int argc, char ** argv) {
     // path to the model gguf file
     
     // prompt to generate text from
-    std::string prompt = "Once upon a time, in a land far, far away, there was a small village nestled between two great mountains. The villagers were known for their kindness and their peculiar habit of singing to the stars every night. One day, a mysterious traveler arrived at the village gates, carrying nothing but a worn-out leather bag and a wooden staff. The traveler claimed to have come from the other side of the world, seeking a legendary artifact said to be hidden deep within the caves of the northern mountain.";
+    std::string prompt = R"(The traveler, an elderly figure with eyes that held the glimmer of distant constellations, was welcomed with cautious hospitality. The village elder, Elara, offered him bread and a seat by the communal fire. As the first stars pierced the twilight, the villagers, as was their custom, began a soft, harmonic hum that slowly swelled into their nightly song. The traveler listened, a faint smile touching his lips. "You still sing the old tuning," he remarked, his voice like dry leaves. "The one that calls to the Sleeper."
+Elara grew still. The "Sleeper" was a name found only in the village's oldest scrolls, referring to the ancient guardian of the fabled artifact—a luminous orb said to hold the memory of the first dawn. Its hiding place was a secret guarded by generations, not out of greed, but out of a sacred warning: the orb's light could either heal or unravel the fabric of their tranquil world.
+
+The traveler introduced himself as Kael. From his bag, he produced not treasures, but etched stones and fragmented maps that told of a great imbalance spreading across the lands—crops failing under sunless skies, rivers flowing backward, and a creeping silence where music once lived. He believed only the primordial light of the orb could mend this rift. His journey had taken decades, leading him ever to this secluded valley and its singing people.
+
+The villagers debated through the night. Some saw Kael as a bearer of ill omen; others were moved by the tales of a suffering world they had never known. Their songs, they realized, might have been more than ritual—perhaps a lullaby to keep the Sleeper's dreams gentle, or a ward to keep the orb's power in balance.
+
+As dawn tinted the mountain peaks, Elara made a decision. "We will not give you the orb, for it is not ours to give. But we will show you the path to the caverns. The Sleeper will decide your worth." Kael nodded, his journey nearing its most perilous chapter. The path was not of stone, but of melody—a specific sequence of notes that, when sung correctly, would cause the hidden entrance to reveal itself. The villagers spent the day teaching Kael the celestial melody, a tune that twisted and turned like the mountain's own heartbeat.
+
+That evening, under a blanket of newly emerging stars, the villagers sang not alone, but with the traveler's raspy voice woven into theirs. As the final note hung in the crisp air, a low rumble echoed from the northern mountain. A fissure of soft, blue light appeared on the cliff face, as if the stone itself had drawn a breath. Kael shouldered his bag, gripped his staff, and turned towards the luminous crack. The fate of two worlds now rested on the wisdom of a Sleeper he had never seen, and a song he had only just learned.)";
     // number of layers to offload to the GPU
     int ngl = 99;
     // number of tokens to predict

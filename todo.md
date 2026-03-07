@@ -38,4 +38,11 @@
   - *已完成*，有一定提升，但不多，因为现在的算法都是集中于decode阶段的。引入的延时大约是 100 微秒 per dynamic tensor
 
 - [] 检查各个算子运算速度随着 batch 提升的情况，新的目标是关注 prefill 加速，现在的版本的 prefill 速度远远没有到极限。
+  - 发现通过flops估计不太行，不同量化的矩阵乘性能显著不同。
+  - *已完成*，随batch增长改变按线性估计。暂时以 batch_size = 1024 为基准。
 
+- [] 尝试添加依据 prefill 的 override 策略
+  - 已添加，prefill 效果还可以，但提升也没有特别大，与 prefill batch size 强相关，应当存在甜点 batch size
+  - 需要注意的是，当 batch size 很大的时候，llama.cpp 默认的 base 策略表现就已经很好，因为单个 weight 对应的中间结点计算时间会超过并发传输的时间，这时候再改变 override 策略在 prefill 阶段也没有什么提升空间。
+
+- [] 有 offload 过激的神秘小bug要修一下。

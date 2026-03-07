@@ -1016,6 +1016,7 @@ bool is_dynamic_tensor(struct ggml_tensor * tensor){
 
 static void pipo_alloc_dynamic_tensors(ggml_backend_sched_t sched){
     sched->pipo_buf = ggml_backend_alloc_ctx_tensors(sched->pipo_ctx, sched->backends[0]);
+    if (!sched->pipo_buf) return;
     ggml_backend_buffer_set_usage(sched->pipo_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     GGML_LOG_INFO("%s: %12s dynamic buffer size = %8.2f MiB\n",__func__,
                  ggml_backend_buffer_name(sched->pipo_buf), ggml_backend_buffer_get_size(sched->pipo_buf) / 1024.0 / 1024.0);
@@ -1283,9 +1284,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         bool prev_has_dynamic_input = false;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
-            if (strcmp(node->name, "ffn_gate-23") == 0){
-                fprintf(stderr, "trap\n");
-            }
             if (ggml_is_view_op(node->op)) {
                 continue;
             }

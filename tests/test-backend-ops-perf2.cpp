@@ -11,10 +11,6 @@ using namespace std;
 #include <ggml-backend.h>
 #include <ggml.h>
 
-
-/*
-    TODO: reserve cuda mem base on graph alloc and kv cache alloc instead of guessing
-*/
 static std::vector<std::string> escape_patterns_manual(const std::vector<std::string> & patterns) {
     std::vector<std::string> escaped_patterns;
     escaped_patterns.reserve(patterns.size());
@@ -40,6 +36,13 @@ static std::vector<std::string> escape_patterns_manual(const std::vector<std::st
 
     return escaped_patterns;
 }
+
+/* single test result */
+struct SingleTestResult {
+    const pipo_unique_op & op;
+    ggml_backend_t         backend;
+    double                 compute_ms;
+};
 
 /* tensor random utils
     refer to test-backend-ops.cpp
@@ -291,15 +294,8 @@ static void init_tensor_uniform(ggml_tensor * tensor,
     }
 }
 
-/* single test result */
-struct SingleTestResult {
-    const pipo_unique_op & op;
-    ggml_backend_t         backend;
-    double                 compute_ms;
-};
-
-static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend, int n_iter) {
-    ggml_init_params    init_params = {
+static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend, int n_iter, int batch_size) {
+    ggml_init_params init_params = {
         /* .mem_size = */ ggml_tensor_overhead() * 128 + ggml_graph_overhead_custom(8192, false),
         /* .mem_base = */ NULL,
         /* .no_alloc = */ true,
@@ -363,12 +359,11 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
     bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
     if (is_cpu) {
         n_runs = 20;
-    } else if (op.op_type == GGML_OP_MUL_MAT){
+    } else if (op.op_type == GGML_OP_MUL_MAT) {
         n_runs = 200;
-    }
-    else{
+    } else {
         n_iter = 500000;
-        n_runs = 5000;
+        n_runs = max(1, 5000 / batch_size);
     }
     for (int i = 1; i < n_runs; i++) {
         ggml_graph_add_node(gf, result);
@@ -388,20 +383,51 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
     return compute_ms;
 }
 
+static void print_usage(int argc, char ** argv) {
+    cerr << "Usage: " << argv[0] << " -m <model> [-n <batch-size>]\n";
+}
+
 /* main */
 int main(int argc, char ** argv) {
-    if (argc != 3) {
-        cerr << "Usage: " << argv[0] << " -m <model>\n";
-        return 1;
+    int    batch_size = 1024;
+    int context_size = 4096;
+    string model_path;
+    {
+        int i = 1;
+        for (; i < argc; i++) {
+            if (strcmp(argv[i], "-m") == 0) {
+                if (i + 1 < argc) {
+                    model_path = argv[++i];
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-n") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        batch_size = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            }
+        }
+        if (model_path.empty()) {
+            print_usage(argc, argv);
+            return 1;
+        }
     }
-    const char * model_path = argv[2];
     // load backends
     ggml_backend_load_all();
     // load model
     llama_model_params model_params = llama_model_default_params();
     model_params.use_mmap           = false;
     model_params.no_alloc           = true;
-    llama_model * model             = llama_model_load_from_file(model_path, model_params);
+    llama_model * model             = llama_model_load_from_file(model_path.c_str(), model_params);
 
     if (model == NULL) {
         cerr << __LINE__ << ": Failed to load model\n";
@@ -410,27 +436,28 @@ int main(int argc, char ** argv) {
 
     // initialize context
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx                = 1;
-    ctx_params.n_batch              = 1;
+    ctx_params.n_ctx                = context_size;
+    ctx_params.n_batch              = batch_size;
     ctx_params.no_perf              = true;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
-
-    if (ctx == NULL) {
+    llama_context * batched_ctx = llama_init_from_model(model, ctx_params);
+    if (ctx == NULL || batched_ctx == NULL) {
         cerr << __LINE__ << ": Failed to create llama_context\n";
         return 1;
     }
-    ggml_cgraph *                      model_gf = pipo_get_graph(ctx);
-    std::unordered_set<pipo_unique_op> unique_ops;
-    for (int i = 0; i < ggml_graph_n_nodes(model_gf); ++i) {
-        ggml_tensor * node = ggml_graph_node(model_gf, i);
+    ggml_cgraph *                      decode_gf = pipo_get_graph(ctx, 1);
+    ggml_cgraph *                      batched_gf = pipo_get_graph(batched_ctx, batch_size);
+
+    // in each pair, first is decode op, second is batched op
+    std::unordered_map<pipo_unique_op, pipo_unique_op> unique_ops_map;
+    for (int i = 0; i < ggml_graph_n_nodes(decode_gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(decode_gf, i);
         if (!node || pipo_is_view_op(node->op)) {
             continue;
         }
         pipo_unique_op op(node);
-        if (!unique_ops.insert(op).second) {
-            continue;
-        }
+        unique_ops_map.insert(make_pair(op, pipo_unique_op(ggml_graph_node(batched_gf, i))));
     }
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_name("cpu", NULL);
@@ -447,7 +474,10 @@ int main(int argc, char ** argv) {
         cerr << __LINE__ << ": GPU backend not found\n";
         return 1;
     }
-    auto &                                               ops = unique_ops;
+    llama_free(ctx);
+    llama_free(batched_ctx);
+    auto &                                               ops = unique_ops_map;
+    // decode perf result
     unordered_map<string, unordered_map<string, double>> op_perf_results;
     const char *                                         cpu_backend_name = ggml_backend_name(cpu_backend);
     op_perf_results[cpu_backend_name]                                     = unordered_map<string, double>();
@@ -455,13 +485,23 @@ int main(int argc, char ** argv) {
     const char * gpu_backend_name     = ggml_backend_name(gpu_backend);
     op_perf_results[gpu_backend_name] = unordered_map<string, double>();
 
-    for (auto & op : ops) {
+    for (auto & op_pair : ops) {
+        auto& op = op_pair.first;
         cerr << "perf op: " << op.short_desc() << '\n' << "key = " << op.op_key() << "\n\n";
-        op_perf_results[cpu_backend_name][op.op_key()] = run_single_bench(op, cpu_backend, 20);
-        fprintf(stderr, "%s # %lf\n", cpu_backend_name, op_perf_results[cpu_backend_name][op.op_key()]);
-
-        op_perf_results[gpu_backend_name][op.op_key()] = run_single_bench(op, gpu_backend, 2000);
+        op_perf_results[cpu_backend_name][op.op_key()] = run_single_bench(op, cpu_backend, 20, 1);
+            fprintf(stderr, "%s # %lf\n", cpu_backend_name, op_perf_results[cpu_backend_name][op.op_key()]);
+        op_perf_results[gpu_backend_name][op.op_key()] = run_single_bench(op, gpu_backend, 2000, 1);
         fprintf(stderr, "%s # %lf\n\n", gpu_backend_name, op_perf_results[gpu_backend_name][op.op_key()]);
+    }
+
+    // batched perf result
+    unordered_map<string, double> op_perf_batched;
+    for (auto& op_pair : ops){
+        const string key = op_pair.first.op_key();
+        auto& op = op_pair.second;
+        cerr << "perf op: " << op.short_desc() << '\n' << "key = " << op.op_key() << "\n\n";
+        op_perf_batched[key] = run_single_bench(op, gpu_backend, 2000, batch_size) / batch_size;
+        fprintf(stderr, "%s # %lf per batch\n\n", gpu_backend_name, op_perf_batched[key]);
     }
     // test cpu -> gpu bandwidth
     double h2d_bandwidth;
@@ -496,7 +536,12 @@ int main(int argc, char ** argv) {
     }
     nlohmann::json result;
     result["op_perf_result"] = op_perf_results;
+    result["op_perf_batched"] = op_perf_batched;
     result["h2d_bandwidth"]  = h2d_bandwidth;
+    result["batch_size"]     = batch_size;
+
+    // TODO: we need a independent context size here
+    result["context_size"] = context_size;
     cout << result.dump(4);
     return 0;
 }

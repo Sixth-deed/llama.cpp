@@ -236,11 +236,11 @@ bool pipo_unique_op::operator==(const pipo_unique_op & other) const {
            src_types == other.src_types && src_nes == other.src_nes;
 }
 
-ggml_cgraph* pipo_get_graph(llama_context* ctx){
+ggml_cgraph* pipo_get_graph(llama_context* ctx, int batch_size){
     auto mctx = ctx->get_memory()->init_full();
-    return ctx->graph_reserve(1
+    return ctx->graph_reserve(batch_size
         , 1
-        , 1, mctx.get(), true);
+        , batch_size, mctx.get(), true);
 }
 
 size_t pipo_get_mem_usage(llama_context* ctx){

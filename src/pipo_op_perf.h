@@ -44,7 +44,7 @@ namespace std{
         }
     };
 }
-ggml_cgraph* pipo_get_graph(llama_context* ctx);
+ggml_cgraph* pipo_get_graph(llama_context* ctx, int batch_size);
 size_t pipo_get_mem_usage(llama_context* ctx);
 
 bool pipo_is_view_op(enum ggml_op op);
