@@ -1257,7 +1257,7 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_memory(dev, &free_memory, &_);
     fprintf(stderr, "Env free mem = %.2lf MB\n", (double) free_memory / 1024.0 / 1024.0);
 
-    free_memory = (free_memory - extra_buf_use) - (size_t) 970 * 1024 * 1024;
+    free_memory = (free_memory - extra_buf_use) - (size_t) 1970 * 1024 * 1024;
 
     fprintf(stderr, "Target weight mem usage = %.2lf MB\n", (double) free_memory / 1024.0 / 1024.0);
 
@@ -1282,7 +1282,7 @@ int main(int argc, char ** argv) {
     sort(tensor_by_name.begin(), tensor_by_name.end(), [&](const auto & a, const auto & b) {
         return tensor_by_name_node_idx[a.second] < tensor_by_name_node_idx[b.second];
     });
-    #if 0
+    #if 1
     auto [override_list, offload_list] = dp_strategy(gf, tensor_by_name, op_perf_results, cpu_backend_name, gpu_backend_name, free_memory,
                              h2d_bandwidth, alpha, beta, theta);
     #elif 0

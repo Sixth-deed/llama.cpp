@@ -11,6 +11,8 @@ using namespace std;
 #include <ggml-backend.h>
 #include <ggml.h>
 
+#include <init_tensor_cuda.h>
+
 static std::vector<std::string> escape_patterns_manual(const std::vector<std::string> & patterns) {
     std::vector<std::string> escaped_patterns;
     escaped_patterns.reserve(patterns.size());
@@ -60,15 +62,50 @@ struct SingleTestResult {
 #include <random>
 #include <thread>
 
+static ggml_backend_t cuda_backend = nullptr;
+static bool try_cuda_init_tensor(ggml_tensor* t, float min, float max){
+    if (!init_tensor_cuda_support_type(t->type))
+        return false;
+    assert(cuda_backend);
+    ggml_init_params init_params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 1 + ggml_graph_overhead_custom(8192, false),
+        /* .mem_base = */ NULL,
+        /* .no_alloc = */ true,
+    };
+    struct ggml_context *        ctx = ggml_init(init_params);
+    ggml_tensor* cuda_t = ggml_dup_tensor(ctx, t);
+    ggml_backend_buffer* buf = ggml_backend_alloc_ctx_tensors(ctx, cuda_backend);
+    if (!buf){
+        ggml_free(ctx);
+        fprintf(stderr, "%s: cuda init tensor fail\n", __func__);
+        return false;
+    }
+    // int64_t begin = ggml_time_ms();
+    if (init_tensor_cuda_simple(cuda_t, min, max) != 0){
+        ggml_free(ctx);
+        ggml_backend_buffer_free(buf);
+        fprintf(stderr, "%s: cuda init tensor fail\n", __func__);
+        return false;
+    }
+    // int64_t end = ggml_time_ms();
+    // fprintf(stderr, "cuda filled tensor of size [%3ld,%3ld,%3ld,%3ld] in %ld ms\n", t->ne[0], t->ne[1], t->ne[2], t->ne[3], end - begin);
+    ggml_backend_tensor_copy(cuda_t,t);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buf);
+    return true;
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor,
                                 float         min     = -1.0f,
                                 float         max     = 1.0f,
                                 int64_t       int_min = 0,
                                 int64_t       int_max = 100) {
     size_t nels = ggml_nelements(tensor);
-
+    if (try_cuda_init_tensor(tensor, min, max)){
+        return;
+    }
     // 处理整数类型
-    if (tensor->type == GGML_TYPE_I8 || tensor->type == GGML_TYPE_I16 || tensor->type == GGML_TYPE_I32 ||
+    else if (tensor->type == GGML_TYPE_I8 || tensor->type == GGML_TYPE_I16 || tensor->type == GGML_TYPE_I32 ||
         tensor->type == GGML_TYPE_I64) {
         // 为整数类型创建对应大小的缓冲区
         size_t element_size = 0;
@@ -168,6 +205,7 @@ static void init_tensor_uniform(ggml_tensor * tensor,
     }
     // 处理浮点数类型
     else if (tensor->type == GGML_TYPE_F32) {
+
         std::vector<float> data(nels);
         {
             // parallel initialization
@@ -359,11 +397,11 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
     bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
     if (is_cpu) {
         n_runs = 20;
-    } else if (op.op_type == GGML_OP_MUL_MAT) {
+    } else if (op.op_type == GGML_OP_MUL_MAT || (op.op_type == GGML_OP_FLASH_ATTN_EXT && batch_size > 8)) {
         n_runs = 200;
     } else {
-        n_iter = 500000;
-        n_runs = max(1, 5000 / batch_size);
+        n_iter = max(1, 500000 / ((int)sqrt(batch_size)) + 1);
+        n_runs = (5000 / batch_size) + 1;
     }
     for (int i = 1; i < n_runs; i++) {
         ggml_graph_add_node(gf, result);
@@ -371,12 +409,16 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
     // 6. 执行计算图
     n_iter                  = n_iter / n_runs;
     int64_t t_compute_start = ggml_time_us();
-    for (int i = 0; i < n_iter; i++) {
+    int i = 0;
+    for (; i < n_iter; i++) {
         ggml_backend_graph_compute(backend, gf);
+        int64_t t_compute_end = ggml_time_us();
+        // 单个 op perf 不超过 10s
+        if (t_compute_end - t_compute_start > (int64_t)1e6 * 10) break;
     }
 
     int64_t t_compute_end = ggml_time_us();
-    double  compute_ms    = (t_compute_end - t_compute_start) / 1000.0 / (n_iter * n_runs);
+    double  compute_ms    = (t_compute_end - t_compute_start) / 1000.0 / (i * n_runs);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -474,6 +516,7 @@ int main(int argc, char ** argv) {
         cerr << __LINE__ << ": GPU backend not found\n";
         return 1;
     }
+    cuda_backend = gpu_backend;
     llama_free(ctx);
     llama_free(batched_ctx);
     auto &                                               ops = unique_ops_map;
