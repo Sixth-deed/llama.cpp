@@ -432,7 +432,7 @@ static void print_usage(int argc, char ** argv) {
 /* main */
 int main(int argc, char ** argv) {
     int    batch_size = 1024;
-    int context_size = 4096;
+    int prompt_len = 3072;
     string model_path;
     {
         int i = 1;
@@ -444,10 +444,23 @@ int main(int argc, char ** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
-            } else if (strcmp(argv[i], "-n") == 0) {
+            } else if (strcmp(argv[i], "-p") == 0) {
                 if (i + 1 < argc) {
                     try {
                         batch_size = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            }
+            else if (strcmp(argv[i], "-n") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        prompt_len = std::stoi(argv[++i]);
                     } catch (...) {
                         print_usage(argc, argv);
                         return 1;
@@ -463,6 +476,8 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+
+    int context_size = prompt_len + batch_size - 1;
     // load backends
     ggml_backend_load_all();
     // load model
