@@ -1,6 +1,6 @@
 {
     "offloads": [
-        "blk\\.(2|6|10|14|18|22|26|30)\\.ffn_down\\.weight"
+        "blk\\.(2|5|8|11|14|17|20|23|26|29)\\.ffn_down\\.weight"
     ],
     "overrides": [
         "^token_embd\\.weight$",
