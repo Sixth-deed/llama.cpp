@@ -398,10 +398,10 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
     if (is_cpu) {
         n_runs = 20;
     } else if (op.op_type == GGML_OP_MUL_MAT || (op.op_type == GGML_OP_FLASH_ATTN_EXT && batch_size > 8)) {
-        n_runs = 200;
+        n_runs = max(1, 200 / max((int)sqrt(batch_size), 1));
     } else {
         n_iter = max(1, 500000 / ((int)sqrt(batch_size)) + 1);
-        n_runs = (5000 / batch_size) + 1;
+        n_runs = max((5000 / batch_size), 1);
     }
     for (int i = 1; i < n_runs; i++) {
         ggml_graph_add_node(gf, result);
@@ -426,13 +426,13 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
 }
 
 static void print_usage(int argc, char ** argv) {
-    cerr << "Usage: " << argv[0] << " -m <model> [-n <batch-size>]\n";
+    cerr << "Usage: " << argv[0] << " -m <model> [-p prefill-batch-size] [-n n_decode]\n";
 }
 
 /* main */
 int main(int argc, char ** argv) {
-    int    batch_size = 1024;
-    int prompt_len = 3072;
+    int    batch_size = 100;
+    int decode_len = 32;
     string model_path;
     {
         int i = 1;
@@ -460,7 +460,7 @@ int main(int argc, char ** argv) {
             else if (strcmp(argv[i], "-n") == 0) {
                 if (i + 1 < argc) {
                     try {
-                        prompt_len = std::stoi(argv[++i]);
+                        decode_len = std::stoi(argv[++i]);
                     } catch (...) {
                         print_usage(argc, argv);
                         return 1;
@@ -477,7 +477,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    int context_size = prompt_len + batch_size - 1;
+    int context_size = decode_len + batch_size - 1;
     // load backends
     ggml_backend_load_all();
     // load model
