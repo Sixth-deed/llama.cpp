@@ -331,6 +331,26 @@ static void init_tensor_uniform(ggml_tensor * tensor,
         GGML_ABORT("Unsupported tensor type in init_tensor_uniform");
     }
 }
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+    std::random_device rd;
+    std::default_random_engine rng(rd());
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type == GGML_TYPE_I32) {
+            if (pipo_is_view_op(t->op)) { continue; }
+            // ids
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = i % n_mats;
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        } else {
+            init_tensor_uniform(t);
+        }
+    }
+}
 
 static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend, int n_iter, int batch_size) {
     ggml_init_params init_params = {
@@ -377,6 +397,8 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
     if (op.op_type == GGML_OP_GET_ROWS) {
         init_tensor_uniform(src_tensors.at(0));
         init_tensor_uniform(src_tensors.at(1), 0, 0, 0, src_tensors.at(0)->ne[1] - 1);
+    } else if (op.op_type == GGML_OP_MUL_MAT_ID){
+        init_mul_mat_id_tensors(ctx, result->ne[1]);
     } else {
         for (size_t i = 0; i < src_tensors.size(); i++) {
             init_tensor_uniform(src_tensors.at(i));
@@ -395,6 +417,7 @@ static double run_single_bench(const pipo_unique_op & op, ggml_backend_t backend
     // duplicate the op
     int  n_runs;
     bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    
     if (is_cpu) {
         n_runs = 20;
     } else if (op.op_type == GGML_OP_MUL_MAT || (op.op_type == GGML_OP_FLASH_ATTN_EXT && batch_size > 8)) {

@@ -195,12 +195,12 @@ static pair<vector<string>, vector<string>> dp_strategy(
     // 由于 mem_bin 是近似的，有可能算法实际给出的结果使用了过多的内存，需要重新跑一遍整个算法来获取有效的结果。
     size_t actual_mem_usage;
     // 稍微留一点余量，尽量不触发重跑
-    free_mem -= 2 * mem_bin_size;
+    size_t target_mem_usage = free_mem - 2 * mem_bin_size;
     fprintf(stderr, "alg target mem usage = %.2lf MB\n", (double) free_mem / 1024.0 / 1024.0);
     int    iter     = 0;
     int    max_iter = 10;
     do {
-        int       mem_bin_cnt = mem_bin(free_mem);
+        int       mem_bin_cnt = mem_bin(target_mem_usage);
         const int W           = weight_cnt;
         const int T           = ttf_bin_cnt;
         const int M           = mem_bin_cnt;
@@ -480,11 +480,11 @@ static pair<vector<string>, vector<string>> dp_strategy(
         if (actual_mem_usage <= free_mem) {
             return { override_list, offload_list };
         }
-        size_t new_target_mem = free_mem - (actual_mem_usage - free_mem);
+        target_mem_usage = target_mem_usage - (actual_mem_usage - free_mem);
         fprintf(stderr,
                 "alg actual provide strategy with mem use of %ld bytes, but target memory usage is %ld bytes.\nRerun "
                 "alg with new target mem = %ld\n",
-                actual_mem_usage, free_mem, new_target_mem);
+                actual_mem_usage, free_mem, target_mem_usage);
         iter += 1;
     } while (iter < max_iter);
     fprintf(stderr, "alg failed to find a strategy with max_retires = %d\n", max_iter);
@@ -526,7 +526,7 @@ static vector<string> offload_dp(vector<string> &                               
             }
         }
     }
-    double alpha            = 1;
+    double alpha            = 1.5;
     auto   gpu_compute_time = [&](n_id node_id) -> double {
         const ggml_tensor * t = ggml_graph_node(gf, node_id);
         if (pipo_is_view_op(t->op)) {
@@ -548,7 +548,7 @@ static vector<string> offload_dp(vector<string> &                               
             fprintf(stderr, "cpu not support op\n%s\n", pipo_make_op_key(t).c_str());
             return INFINITY;
         }
-        return op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) * alpha;
+        return op_perf_results.at(cpu_name).at(pipo_make_op_key(t));
     };
     vector<string>        offload_list;
     unordered_set<string> override_set(override_list.begin(), override_list.end());
@@ -632,7 +632,7 @@ static vector<string> offload_dp(vector<string> &                               
             }
         }
     }
-    double min_gain = INFINITY;
+    double min_gain = 0;
     w_id   min_last = -1;
     for (w_id i = 0; i < weight_cnt; i++) {
         if (min_gain > offload_gain[i]) {
@@ -650,7 +650,7 @@ static vector<string> offload_dp(vector<string> &                               
     reverse(offload_list.begin(), offload_list.end());
     reverse(offload_ids.begin(), offload_ids.end());
     prev = -1;
-    for (int i = 0; i < offload_ids.size(); i++){
+    for (size_t i = 0; i < offload_ids.size(); i++){
         w_id wid = offload_ids[i];
         fprintf(stderr, "offload tensor[%d] %-10s\ntensor transfer time = %4lfms, tensor mid compute time = %4lfms\n", wid, tensors_by_name[wid].first.c_str(), weight_trans_time[wid], computation_between(prev, wid));
         prev = wid;
@@ -953,31 +953,6 @@ static pair<vector<string>, vector<string>> prefill_first_strategy(
 
         reverse(override_list.begin(), override_list.end());
     }
-    double alpha = 1.0;
-    double beta = 1.6;
-    auto gpu_compute_time = [&](n_id node_id) -> double {
-        const ggml_tensor * t = ggml_graph_node(gf, node_id);
-        if (pipo_is_view_op(t->op)) {
-            return 0;
-        }
-        if (!op_perf_results.count(gpu_name) || !op_perf_results.at(gpu_name).count(pipo_make_op_key(t)) ||
-            op_perf_results.at(gpu_name).at(pipo_make_op_key(t)) == -1) {
-            return INFINITY;
-        }
-        return op_perf_results.at(gpu_name).at(pipo_make_op_key(t));
-    };
-    auto cpu_compute_time = [&](n_id node_id) -> double {
-        const ggml_tensor * t = ggml_graph_node(gf, node_id);
-        if (pipo_is_view_op(t->op)) {
-            return 0;
-        }
-        if (!op_perf_results.count(cpu_name) || !op_perf_results.at(cpu_name).count(pipo_make_op_key(t)) ||
-            op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) == -1) {
-            fprintf(stderr, "cpu not support op\n%s\n", pipo_make_op_key(t).c_str());
-            return INFINITY;
-        }
-        return op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) * alpha;
-    };
     vector<string> offload_list = offload_dp(override_list, gf, tensors_by_name, op_perf_results, _cpu_backend_name, _gpu_backend_name, h2d_bandwidth);
     return {override_list, offload_list};
 }
@@ -992,15 +967,12 @@ static pair<vector<string>, vector<string>> static_like_stratagy(ggml_cgraph* gf
     size_t free_mem,
     double h2d_bandwidth,
     llama_model* model){
-    const string cpu_name(_cpu_backend_name);
     const string gpu_name(_gpu_backend_name);
     // node_index
     using n_id = int;
     // weight_index
     using w_id = int;
-    auto weight_size = [&](w_id weight_id) -> size_t {
-        return ggml_nbytes(tensors_by_name[weight_id].second);
-    };
+
     unordered_map<n_id, w_id> n2w;
     unordered_map<w_id, n_id> w2n;
     {
@@ -1034,18 +1006,7 @@ static pair<vector<string>, vector<string>> static_like_stratagy(ggml_cgraph* gf
         }
         return op_perf_results.at(gpu_name).at(pipo_make_op_key(t));
     };
-    auto cpu_compute_time = [&](n_id node_id) -> double {
-        const ggml_tensor * t = ggml_graph_node(gf, node_id);
-        if (pipo_is_view_op(t->op)) {
-            return 0;
-        }
-        if (!op_perf_results.count(cpu_name) || !op_perf_results.at(cpu_name).count(pipo_make_op_key(t)) ||
-            op_perf_results.at(cpu_name).at(pipo_make_op_key(t)) == -1) {
-            fprintf(stderr, "cpu not support op\n%s\n", pipo_make_op_key(t).c_str());
-            return INFINITY;
-        }
-        return op_perf_results.at(cpu_name).at(pipo_make_op_key(t));
-    };
+    
     size_t mem_usage = 0;
     for (auto& [n, t] : tensors_by_name){
         mem_usage += ggml_nbytes(t);

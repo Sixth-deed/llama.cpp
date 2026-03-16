@@ -62,7 +62,7 @@ llm_build_qwen3moe_pipo::llm_build_qwen3moe_pipo(const llama_model & model, cons
         };
 
         if (t && need_offload(regex, std::string(t->name))) {
-            struct ggml_tensor * dynamic_tensor =  model.name_weight_map.at(std::string(t->name));
+            struct ggml_tensor * dynamic_tensor = ggml_backend_sched_get_pipo_tensor(params.sched, model.name_weight_map.at(std::string(t->name)));
             res->dynamic_src_tensor_list[dynamic_tensor->name].push_back(t);
             res->dynamic_dst_tensor_list[dynamic_tensor->name].push_back(dynamic_tensor);
             return dynamic_tensor;
