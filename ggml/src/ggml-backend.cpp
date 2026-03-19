@@ -1281,7 +1281,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
 
+// #define PIPO_SPLIT_ONLY_BEFORE_DYNAMIC
+#ifndef PIPO_SPLIT_ONLY_BEFORE_DYNAMIC
         bool prev_has_dynamic_input = false;
+#endif
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
             if (ggml_is_view_op(node->op)) {
@@ -1294,12 +1297,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+#ifndef PIPO_SPLIT_ONLY_BEFORE_DYNAMIC
             if (sched->enable_pipo && prev_has_dynamic_input){
                 need_new_split = true;
                 prev_has_dynamic_input = false;
-            }
+            } else
+#endif
             // check dynamic input
-            else if (node_backend_id == cur_backend_id){
+            if (node_backend_id == cur_backend_id){
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -1307,7 +1312,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && sched->enable_pipo && is_dynamic_tensor(src)) {
                         need_new_split = true;
+#ifndef PIPO_SPLIT_ONLY_BEFORE_DYNAMIC
                         prev_has_dynamic_input = true;
+#endif
                         break;
                     }
                 }

@@ -14,7 +14,7 @@ def _pb_render():
     """内部函数：渲染进度条到 stderr"""
     if not _PB_INITIALIZED:
         return
-    
+
     # 计算百分比和填充长度
     percent = 0
     filled_len = 0
@@ -23,7 +23,7 @@ def _pb_render():
         curr = min(_PB_CURRENT, _PB_TOTAL)
         percent = int(100 * curr / _PB_TOTAL)
         filled_len = int(_PB_WIDTH * curr / _PB_TOTAL)
-    
+
     bar = '#' * filled_len + '-' * (_PB_WIDTH - filled_len)
     # 使用 \r 覆盖当前行，输出到 stderr 以免干扰日志文件
     sys.stderr.write(f"\r[{bar}] {percent:3d}%")
@@ -66,6 +66,23 @@ def pb_finish():
     sys.stderr.flush()
 # ====================================================================
 
+@dataclass
+class BenchConfig:
+    prefill_batch: int
+    decode_len: int
+    target_mem_usage: int
+    model_path: Path
+    # bench_output_dir 和 log_dir 将在 __post_init__ 中初始化
+
+    def __post_init__(self):
+        # 使用 f-string 格式化路径
+        self.bench_output_dir = OUTPUT_DIR / f"p{self.prefill_batch}_d{self.decode_len}_m{self.target_mem_usage}_{self.model_path.name.rstrip('.gguf')}"
+        self.bench_output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.log_dir = self.bench_output_dir / "log"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 LLAMA_DIR = SCRIPT_DIR / "../../"
 
@@ -84,41 +101,46 @@ OUTPUT_DIR = LLAMA_DIR / "logs/alg_bench"
 refresh_perf_result = False
 n_runs = 5
 
-@dataclass
-class BenchConfig:
-    prefill_batch: int
-    decode_len: int
-    target_mem_usage: int
-    model_path: Path
-    # bench_output_dir 和 log_dir 将在 __post_init__ 中初始化
-    
-    def __post_init__(self):
-        # 使用 f-string 格式化路径
-        self.bench_output_dir = OUTPUT_DIR / f"p{self.prefill_batch}_d{self.decode_len}_m{self.target_mem_usage}_{self.model_path.name.rstrip('.gguf')}"
-        self.bench_output_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.log_dir = self.bench_output_dir / "log"
-        self.log_dir.mkdir(parents=True, exist_ok=True)
 
+
+
+# ==========================
+# Single Bench run config
+
+# map from alg to alg-no
+alg_map = {
+    "dp": 0,
+    "pf": 1,
+    "static": 2
+,
+    "dp-2": 3,
+    "dp-3":4,
+}
 test_cases = [
-    # BenchConfig(99, 32, 6500, MODEL_QWEN_14B_Q4),
-    # BenchConfig(99, 32, 4000, MODEL_QWEN_14B_Q4),
-    # BenchConfig(412, 100, 6500, MODEL_QWEN_14B_Q4),
-    # BenchConfig(4000, 96, 5500, MODEL_QWEN_14B_Q4),
+    BenchConfig(99, 32, 6500, MODEL_QWEN_14B_Q4),
+    BenchConfig(99, 32, 4000, MODEL_QWEN_14B_Q4),
+    BenchConfig(412, 100, 6500, MODEL_QWEN_14B_Q4),
+    BenchConfig(4000, 96, 5500, MODEL_QWEN_14B_Q4),
     BenchConfig(99, 32, 6000, MODEL_QWEN_MOE_30B_Q4),
     BenchConfig(4000, 96, 5500, MODEL_QWEN_MOE_30B_Q4)
 ]
+# map from (model, mem_usage) to ngl
+base_map = {
+    (MODEL_QWEN_14B_Q4, 6500): 32,
+    (MODEL_QWEN_14B_Q4, 4000): 19,
+    (MODEL_QWEN_14B_Q4, 5500): 27,
+    (MODEL_QWEN_MOE_30B_Q4, 6000): 17,
+    (MODEL_QWEN_MOE_30B_Q4, 5500): 16,
+}
+
+# =======================
+
 log_file = None
 def log(msg: str):
     global log_file
     if (log_file) :
         print(msg, file= log_file)
-# map from alg to alg-no
-alg_map = {
-    # "dp": 0,
-    # "pf": 1,
-    "static": 2
-}
+
 
 def run_command(cmd: list, stdout_path: Path, stderr_path: Path, check: bool = False) -> int:
     """
@@ -173,25 +195,17 @@ def run_alg(op_perf_json: Path, cfg: BenchConfig, alg_name: str):
         "-mem", str(cfg.target_mem_usage),
         "-max-batch", str(cfg.prefill_batch)
     ]
-    
+
     # 运行命令
-    # 这里 check=False，因为我们要根据返回值判断逻辑，而不是直接抛异常
     ret = run_command(cmd, alg_result_path, alg_log_path, check=False)
-    
+
     if ret != 0:
         log(f"Alg {alg_name} generation failed. Check {alg_log_path}")
         return 1
-    
+
     return 0
 
-# map from (model, mem_usage) to ngl
-base_map = {
-    (MODEL_QWEN_14B_Q4, 6500): 33,
-    (MODEL_QWEN_14B_Q4, 4000): 19,
-    (MODEL_QWEN_14B_Q4, 5500): 27,
-    (MODEL_QWEN_MOE_30B_Q4, 6000): 17,
-    (MODEL_QWEN_MOE_30B_Q4, 5500): 16,
-}
+
 
 def run_bench(cfg: BenchConfig, alg_name: str):
     """
@@ -205,17 +219,16 @@ def run_bench(cfg: BenchConfig, alg_name: str):
     bench_log_path = cfg.log_dir / "bench.log"
     log_path = bench_log_dir / f"{alg_name}.log"
     result_path = bench_result_dir / f"{alg_name}.json"
-    
+
     alg_result_path = cfg.bench_output_dir / "algs" / f"alg_{alg_name}.json"
 
     args = [str(BENCH_BIN), "-m", str(cfg.model_path)]
-    
+
     if alg_name == "base":
         # 获取 ngl，如果没有配置则默认 10
         ngl = base_map.get((cfg.model_path, cfg.target_mem_usage), 10)
         args += ["-ngl", str(ngl)]
     else:
-        # 如果是特定算法，使用生成的 json 配置
         if not alg_result_path.exists():
             msg = f"Alg result file not found: {alg_result_path}, skipping bench for {alg_name}"
             log(msg)
@@ -226,8 +239,8 @@ def run_bench(cfg: BenchConfig, alg_name: str):
         args += ["-pipo", str(alg_result_path)]
 
     args += [
-        "-n", str(cfg.decode_len), 
-        "-p", str(cfg.prefill_batch), 
+        "-n", str(cfg.decode_len),
+        "-p", str(cfg.prefill_batch),
         "-run", str(n_runs)
     ]
 
@@ -247,7 +260,7 @@ def bench_test_case(cfg: BenchConfig):
 
     log_file = open(bench_log_path, 'w')
 
-    perf_result_path = cfg.bench_output_dir / "op_perf.json" 
+    perf_result_path = cfg.bench_output_dir / "op_perf.json"
     perf_log_path = cfg.log_dir / "op_perf.log"
 
     # 1. 运行 Perf (如果未复用且文件不存在)
@@ -259,9 +272,9 @@ def bench_test_case(cfg: BenchConfig):
             "-p", str(cfg.prefill_batch),
             "-n", str(cfg.decode_len)
         ]
-        
+
         ret = run_command(cmd, perf_result_path, perf_log_path, check=False)
-        
+
         if ret != 0 or not perf_result_path.exists():
             fail_msg = f"failed to perf ops for Bench Config {cfg}, more information in {perf_log_path}"
             log(fail_msg)
@@ -277,11 +290,11 @@ def bench_test_case(cfg: BenchConfig):
     run_bench(cfg, "base")
 
     # 3. 运行算法基准测试
-    for alg_name, alg_id in alg_map.items():
+    for alg_name, _ in alg_map.items():
         # 先生成算法配置
         ret = run_alg(perf_result_path, cfg, alg_name)
-        
-        if ret == 0:
+
+        if  ret == 0:
             run_bench(cfg, alg_name)
         else:
             log(f"Skipping bench for {alg_name} due to alg generation failure.")
@@ -298,7 +311,7 @@ def main():
     parser.add_argument('-o', '--output', type=Path, default=OUTPUT_DIR, help="Output directory for logs and results")
     parser.add_argument('--refresh-perf-result', action='store_true', help="Refresh existing performance result JSON if exists")
     parser.add_argument('--run', type=int, default=5, help="Number of runs for benchmarking")
-    
+
     args = parser.parse_args()
 
     # 更新全局配置
@@ -318,10 +331,10 @@ def main():
 
     for test_case in test_cases:
         bench_test_case(test_case)
-    
+
     # 结束进度条
     pb_finish()
-    
+
     return 0
 
 if __name__ == "__main__":
